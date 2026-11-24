@@ -1,0 +1,3142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Expense Tracker</title>
+  <meta name="description" content="What comes in, what goes out, and how much of the reserve is left.">
+  <link rel="manifest" href="manifest.webmanifest?v=muted-3">
+  <link rel="apple-touch-icon" href="icon-180.png?v=b46d500c61">
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png?v=b46d500c61">
+  <meta name="theme-color" content="#214c3b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Ledger">
+  <meta name="robots" content="noindex, nofollow">
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #f7f7f4; }
+    img { max-width: 100%; }
+    [hidden] { display: none !important; }
+</style>
+  <script>
+  (function () {
+    /* Mac <-> phone sync, piggybacking on the private GitHub repo these pages
+       already live in. Off by default: nothing changes until a personal
+       access token is entered once per device (tap the sync line to set it
+       up). docs/collections mirror exactly what the artifact's own db
+       capability hands the page, so the app itself needed no changes. */
+    const GH_REPO   = 'Rfernex/Apps-private';
+    const DATA_PATH = 'sync/ledger.json';
+    const APP_ID    = 'ledger';
+    const LS_KEY    = 'householdLedger.v1';
+    const TOKEN_KEY = 'ghSyncToken.v1';
+    const FORCE_KEY = 'ghSyncForceLocal.v1';
+    const POLL_MS   = 45000;
+
+    const getToken = () => { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } };
+    const setToken = (t) => { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch (e) {} };
+
+    let sha = null, docs = {}, pending = new Set(), pushTimer = null;
+    const docListeners = {}, colListeners = {};
+
+    const status = (msg, bad) => { try { window.setSync && window.setSync(msg, bad); } catch (e) {} };
+
+    function api(path, opts) {
+      opts = opts || {};
+      const headers = Object.assign(
+        { Authorization: 'token ' + getToken(), Accept: 'application/vnd.github+json' },
+        opts.headers || {});
+      return fetch('https://api.github.com/repos/' + GH_REPO + '/contents/' + path,
+        Object.assign({ cache: 'no-store' }, opts, { headers }));
+    }
+    const b64encode = (s) => btoa(unescape(encodeURIComponent(s)));
+    const b64decode = (s) => decodeURIComponent(escape(atob(s.replace(/\n/g, ''))));
+
+    async function ghGet() {
+      const r = await api(DATA_PATH);
+      if (r.status === 404) return { sha: null, blob: null };
+      if (r.status === 401 || r.status === 403) throw { auth: true };
+      if (!r.ok) throw new Error('GitHub read failed: ' + r.status);
+      const j = await r.json();
+      return { sha: j.sha, blob: JSON.parse(b64decode(j.content)) };
+    }
+    async function ghPut(blob, prevSha) {
+      const body = { message: 'sync: ' + new Date().toISOString(), content: b64encode(JSON.stringify(blob)) };
+      if (prevSha) body.sha = prevSha;
+      const r = await api(DATA_PATH, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (r.status === 401 || r.status === 403) throw { auth: true };
+      if (r.status === 409 || r.status === 422) throw { conflict: true };
+      if (!r.ok) throw new Error('GitHub write failed: ' + r.status);
+      return (await r.json()).content.sha;
+    }
+
+    function notifyDoc(path) {
+      const val = docs[path];
+      (docListeners[path] || []).forEach((l) => l.cb({ exists: val !== undefined, data: () => val }));
+    }
+    function notifyCollection(prefix) {
+      const rows = Object.keys(docs).filter((k) => k.indexOf(prefix + '/') === 0)
+        .map((k) => ({ id: k.slice(prefix.length + 1), data: () => docs[k] }));
+      (colListeners[prefix] || []).forEach((l) => l.cb({ docs: rows }));
+    }
+    function notifyAll() {
+      Object.keys(docListeners).forEach(notifyDoc);
+      Object.keys(colListeners).forEach(notifyCollection);
+    }
+    function notifyForPath(path) {
+      notifyDoc(path);
+      Object.keys(colListeners).forEach((prefix) => { if (path.indexOf(prefix + '/') === 0) notifyCollection(prefix); });
+    }
+
+    function schedulePush() {
+      if (pushTimer) clearTimeout(pushTimer);
+      pushTimer = setTimeout(push, 2500);
+    }
+    async function push() {
+      pushTimer = null;
+      if (!pending.size) return;
+      const mine = new Set(pending); pending = new Set();
+      try {
+        sha = await ghPut({ app: APP_ID, updatedAt: new Date().toISOString(), docs }, sha);
+        status('Synced');
+      } catch (e) {
+        if (e && e.conflict) {
+          // the other device pushed since our last known version — take its
+          // copy, then lay just what we changed back on top and try again
+          try {
+            const remote = await ghGet();
+            const merged = Object.assign({}, (remote.blob && remote.blob.docs) || {});
+            mine.forEach((p) => { merged[p] = docs[p]; });
+            docs = merged; sha = remote.sha;
+            sha = await ghPut({ app: APP_ID, updatedAt: new Date().toISOString(), docs }, sha);
+            notifyAll();
+            status('Synced');
+          } catch (e2) { mine.forEach((p) => pending.add(p)); status('Offline — saved locally', true); }
+        } else if (e && e.auth) {
+          status('Sync token rejected', true);
+        } else {
+          mine.forEach((p) => pending.add(p));
+          status('Offline — saved locally', true);
+        }
+      }
+    }
+
+    function put(path, data) {
+      // the ready-to-send week email lives in the artifact only — the Mac
+      // cron that reads it never looks at this file, so mirroring it here
+      // would just bloat every sync with a throwaway 50KB blob
+      if (path.indexOf('plans/') === 0) return Promise.resolve();
+      docs[path] = data;
+      pending.add(path);
+      schedulePush();
+      notifyForPath(path);
+      return Promise.resolve();
+    }
+
+    async function pull() {
+      if (pending.size) return;   // don't clobber an edit still in flight
+      try {
+        const remote = await ghGet();
+        if (remote.blob && remote.sha !== sha) {
+          sha = remote.sha;
+          docs = (remote.blob && remote.blob.docs) || {};
+          notifyAll();
+        }
+        status('Synced');
+      } catch (e) {
+        status(e && e.auth ? 'Sync token rejected' : 'Sync interrupted', true);
+      }
+    }
+
+    function seedFromLocal() {
+      // nothing worth keeping on GitHub yet: carry across what is already on
+      // this device, so the first sync isn't a blank slate
+      try {
+        const raw = localStorage.getItem(LS_KEY);
+        const d = raw && JSON.parse(raw);
+        if (d) docs = seedMap(d);
+      } catch (e) {}
+    }
+    function seedMap(d) {
+      return Object.assign({
+        'config/settings': d.settings || {},
+        'config/recurring': { items: d.recurring || [] },
+      }, Object.fromEntries(Object.entries(d.months || {}).map(([k, v]) => ['ledger/' + k, v])));
+
+    }
+
+    let dbReady = null;
+    function init() {
+      if (dbReady) return dbReady;
+      dbReady = (async () => {
+        if (!getToken()) return null;
+        let forceLocal = false;
+        try { forceLocal = localStorage.getItem(FORCE_KEY) === '1'; localStorage.removeItem(FORCE_KEY); } catch (e) {}
+        try {
+          const remote = await ghGet();
+          if (remote.blob && !forceLocal) { docs = remote.blob.docs || {}; sha = remote.sha; }
+          else { seedFromLocal(); sha = await ghPut({ app: APP_ID, updatedAt: new Date().toISOString(), docs }, remote.sha); }
+          status('Synced');
+        } catch (e) {
+          status(e && e.auth ? 'Sync token rejected' : 'Sync interrupted', true);
+          seedFromLocal();
+        }
+        setInterval(pull, POLL_MS);
+        addEventListener('visibilitychange', () => { if (!document.hidden) pull(); });
+        addEventListener('online', () => { pull(); push(); });
+        return {
+          doc: (path) => ({
+            set: (data) => put(path, data),
+            onSnapshot: (cb, errCb) => {
+              (docListeners[path] = docListeners[path] || []).push({ cb, errCb });
+              notifyDoc(path);
+            },
+          }),
+          collection: (prefix) => ({
+            onSnapshot: (cb, errCb) => {
+              (colListeners[prefix] = colListeners[prefix] || []).push({ cb, errCb });
+              notifyCollection(prefix);
+            },
+          }),
+        };
+      })();
+      return dbReady;
+    }
+
+    const save = async ({ filename, data }) => {
+      const blob = data instanceof Blob ? data
+        : new Blob([data], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename || 'download';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 8000);
+    };
+    /* Files attached to a document stay in this device's own IndexedDB. The repo is
+       served publicly by Pages, so nothing personal beyond the app data goes into it. */
+    const assets = (() => {
+      const NAME = 'attachments-' + APP_ID, urls = {};
+      const OK = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf'];
+      const fail = (code) => { const e = new Error(code); e.code = code; return e; };
+      const open = () => new Promise((res, rej) => {
+        const r = indexedDB.open(NAME, 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('f');
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      const run = async (mode, fn) => {
+        const d = await open();
+        return new Promise((res, rej) => {
+          const t = d.transaction('f', mode), st = t.objectStore('f'), rq = fn(st);
+          t.oncomplete = () => { d.close(); res(rq && rq.result); };
+          t.onerror = t.onabort = () => { d.close(); rej(t.error || fail('quota_or_state')); };
+        });
+      };
+      const ready = (async () => {
+        try {
+          const d = await open();
+          await new Promise((res) => {
+            const rq = d.transaction('f').objectStore('f').openCursor();
+            rq.onsuccess = () => { const c = rq.result; if (!c) return res(); urls[c.key] = URL.createObjectURL(c.value); c.continue(); };
+            rq.onerror = () => res();
+          });
+          d.close();
+        } catch (e) {}
+      })();
+      return {
+        ready,
+        urlFor: (id) => urls[id] || '',
+        upload: async (blob, opts) => {
+          const type = (opts && opts.type) || blob.type;
+          if (!OK.includes(type)) throw fail('unsupported_type');
+          if (blob.size > 20 * 1048576) throw fail('too_large');
+          const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          const stored = blob.type === type ? blob : new Blob([blob], { type });
+          try { await run('readwrite', (st) => st.put(stored, id)); } catch (e) { throw fail('quota_or_state'); }
+          urls[id] = URL.createObjectURL(stored);
+          return { id, url: urls[id], sizeBytes: stored.size, contentType: type };
+        },
+        delete: async (id) => {
+          if (urls[id]) { URL.revokeObjectURL(urls[id]); delete urls[id]; }
+          await run('readwrite', (st) => st.delete(id));
+        },
+      };
+    })();
+    window.claude = {
+      use: async (what) => (what === 'downloads' ? { save } : what === 'db' ? init()
+        : what === 'assets' ? (await assets.ready, assets) : null),
+    };
+    window.__ghSync = {
+      lsKey: LS_KEY,
+      repo: GH_REPO,
+      hasToken: () => !!getToken(),
+      probe: async (t) => {
+        try {
+          const r = await fetch('https://api.github.com/repos/' + GH_REPO + '/contents/' + DATA_PATH,
+            { headers: { Authorization: 'token ' + t, Accept: 'application/vnd.github+json' }, cache: 'no-store' });
+          if (r.status === 401 || r.status === 403) return { ok: false, error: 'that token was not accepted' };
+          if (r.status === 404) return { ok: true, remoteHasData: false };
+          if (!r.ok) return { ok: false, error: 'GitHub returned ' + r.status };
+          const j = await r.json();
+          const blob = JSON.parse(b64decode(j.content));
+          return { ok: true, remoteHasData: !!(blob && blob.docs && Object.keys(blob.docs).length) };
+        } catch (e) { return { ok: false, error: 'could not reach GitHub' }; }
+      },
+      activate: (t, forceLocal) => {
+        setToken(t);
+        try { forceLocal ? localStorage.setItem(FORCE_KEY, '1') : localStorage.removeItem(FORCE_KEY); } catch (e) {}
+        location.reload();
+      },
+      clearToken: () => { setToken(''); location.reload(); },
+    };
+  })();
+  </script>
+  <script>
+  (function () {
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    function openModal() {
+      const has = window.__ghSync && window.__ghSync.hasToken();
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,.4)';
+      const panel = document.createElement('div');
+      panel.style.cssText = 'background:var(--surface,#fff);color:var(--ink,#111);max-width:440px;width:100%;'
+        + 'border-radius:14px 14px 0 0;padding:20px 20px calc(20px + env(safe-area-inset-bottom));'
+        + "font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;box-shadow:0 -6px 24px rgba(0,0,0,.25)";
+      wrap.appendChild(panel);
+      document.body.appendChild(wrap);
+      const close = () => wrap.remove();
+      wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+
+      const head = () => `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <b style="font-size:16px">Sync Mac &harr; phone</b>
+        <button id="gs-x" style="border:0;background:none;font-size:22px;line-height:1;color:var(--ink-3,#888);cursor:pointer">&times;</button>
+      </div>`;
+
+      function renderOff() {
+        panel.innerHTML = head() + `
+          <p style="margin:0 0 10px;color:var(--ink-2,#444)">Paste a GitHub personal access token, scoped to just this one repository, and this device starts syncing with your others through it.</p>
+          <ol style="margin:0 0 14px;padding-left:18px;color:var(--ink-2,#444)">
+            <li>github.com &rarr; Settings &rarr; Developer settings &rarr; Fine-grained tokens &rarr; Generate new token</li>
+            <li>Repository access: only <b>${esc(window.__ghSync.repo)}</b></li>
+            <li>Permissions &rarr; Contents: <b>Read and write</b></li>
+            <li>Generate, copy the token, paste it below</li>
+          </ol>
+          <input id="gs-tok" type="password" placeholder="github_pat_&hellip;" autocapitalize="off" autocorrect="off" spellcheck="false"
+            style="width:100%;box-sizing:border-box;padding:11px;border:1px solid var(--line-strong,#ccc);border-radius:8px;font:13px ui-monospace,monospace;margin-bottom:6px">
+          <p id="gs-err" style="margin:0 0 10px;color:var(--neg,#b00);font-size:12.5px"></p>
+          <button id="gs-on" style="width:100%;padding:11px;border:0;background:var(--accent,#333);color:var(--accent-ink,#fff);border-radius:8px;font:inherit;font-weight:600;cursor:pointer">Turn on sync</button>`;
+        panel.querySelector('#gs-x').addEventListener('click', close);
+        const tok = panel.querySelector('#gs-tok'), err = panel.querySelector('#gs-err'), on = panel.querySelector('#gs-on');
+        on.addEventListener('click', async () => {
+          const t = tok.value.trim();
+          if (!t) return;
+          err.textContent = '';
+          on.disabled = true; on.textContent = 'Checking…';
+          const r = await window.__ghSync.probe(t);
+          if (!r.ok) {
+            err.textContent = 'Could not turn on sync: ' + r.error + '.';
+            on.disabled = false; on.textContent = 'Turn on sync';
+            return;
+          }
+          let localHasData = false;
+          try { localHasData = !!localStorage.getItem(window.__ghSync.lsKey); } catch (e) {}
+          if (r.remoteHasData && localHasData) {
+            renderConflict(t);
+          } else {
+            window.__ghSync.activate(t, localHasData && !r.remoteHasData);
+          }
+        });
+      }
+
+      function renderConflict(t) {
+        panel.innerHTML = head() + `
+          <p style="margin:0 0 6px;color:var(--ink-2,#444)">This device already has its own data, and so does the sync file on GitHub — most likely from another device. Which should this device use from now on?</p>
+          <p style="margin:0 0 14px;color:var(--ink-3,#888);font-size:12.5px">Whichever you don't pick is not deleted anywhere else — this only decides what this one device shows and then syncs onward.</p>
+          <button id="gs-keepremote" style="width:100%;padding:11px;border:0;background:var(--accent,#333);color:var(--accent-ink,#fff);border-radius:8px;font:inherit;font-weight:600;cursor:pointer;margin-bottom:8px">Use what's on GitHub (from your other device)</button>
+          <button id="gs-keeplocal" style="width:100%;padding:11px;border:1px solid var(--line-strong,#ccc);background:none;color:var(--ink,#111);border-radius:8px;font:inherit;cursor:pointer">Use what's on this device instead</button>`;
+        panel.querySelector('#gs-x').addEventListener('click', close);
+        panel.querySelector('#gs-keepremote').addEventListener('click', () => window.__ghSync.activate(t, false));
+        panel.querySelector('#gs-keeplocal').addEventListener('click', () => window.__ghSync.activate(t, true));
+      }
+
+      function renderOn() {
+        panel.innerHTML = head() + `
+          <p style="margin:0 0 14px;color:var(--ink-2,#444)">This device syncs through the private GitHub repository these apps are hosted from. A change here reaches your other device within about a minute.</p>
+          <button id="gs-off" style="width:100%;padding:11px;border:1px solid var(--line-strong,#ccc);background:none;color:var(--neg,#b00);border-radius:8px;font:inherit;cursor:pointer">Turn off sync on this device</button>`;
+        panel.querySelector('#gs-x').addEventListener('click', close);
+        panel.querySelector('#gs-off').addEventListener('click', () => {
+          if (confirm("Turn off sync on this device? Nothing is deleted — this device just stops checking in, and keeps the data it has.")) {
+            window.__ghSync.clearToken();
+          }
+        });
+      }
+
+      has ? renderOn() : renderOff();
+    }
+
+    // The rail's own sync line is desktop-only — each app hides the whole
+    // rail under its phone breakpoint, taking the sync line with it. Wire
+    // that line when it's actually on screen, but also keep a small floating
+    // control around for whenever it isn't, so phones always have a way in.
+    function railSyncVisible() {
+      const el = document.querySelector('.rail .sync');
+      return !!(el && el.offsetParent !== null);
+    }
+
+    let fab = null, fabDot = null;
+    function setFabStatus(msg, bad) {
+      if (!fabDot) return;
+      fabDot.style.background = !window.__ghSync.hasToken() ? '#999'
+        : bad ? 'var(--neg,#b00)' : 'var(--pos,#2a7)';
+      fab.title = msg || '';
+    }
+    function ensureFab() {
+      const show = !railSyncVisible();
+      if (show && !fab) {
+        fab = document.createElement('button');
+        fab.id = 'gs-fab';
+        fab.setAttribute('aria-label', 'Sync between devices');
+        fab.style.cssText = 'position:fixed;top:calc(9px + env(safe-area-inset-top));right:9px;z-index:50;'
+          + 'display:flex;align-items:center;gap:6px;padding:6px 11px 6px 8px;border-radius:999px;border:0;'
+          + 'background:var(--surface,#fff);color:var(--ink-2,#444);box-shadow:0 1px 5px rgba(0,0,0,.22);'
+          + "font:11px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-weight:600;cursor:pointer";
+        fabDot = document.createElement('i');
+        fabDot.style.cssText = 'width:7px;height:7px;border-radius:50%;background:#999;flex:none';
+        const txt = document.createElement('span');
+        txt.textContent = 'Sync';
+        fab.appendChild(fabDot); fab.appendChild(txt);
+        fab.addEventListener('click', openModal);
+        document.body.appendChild(fab);
+        setFabStatus();
+      } else if (!show && fab) {
+        fab.remove(); fab = null; fabDot = null;
+      }
+    }
+
+    function wire() {
+      if (!window.__ghSync) return;
+      const el = document.querySelector('.sync');
+      if (el) {
+        el.style.cursor = 'pointer';
+        el.title = 'Set up syncing between your devices';
+        el.addEventListener('click', openModal);
+      }
+      ensureFab();
+      addEventListener('resize', ensureFab);
+      // the app's own status line (and our fab) both track this same call
+      const origSetSync = window.setSync;
+      if (typeof origSetSync === 'function') {
+        window.setSync = (msg, bad) => { origSetSync(msg, bad); setFabStatus(msg, bad); };
+      }
+    }
+    if (document.readyState === 'loading') addEventListener('DOMContentLoaded', wire); else wire();
+  })();
+  </script>
+  <script>
+  if ('serviceWorker' in navigator) {
+    addEventListener('load', () => {
+      // updateViaCache:'none' so the worker script itself is never served stale
+      navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+        .then((reg) => reg.update().catch(() => {}))
+        .catch(() => {});
+      // a new worker taking over means the page it rendered is out of date
+      let reloading = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (reloading) return;
+        reloading = true;
+        location.reload();
+      });
+    });
+  }
+  </script>
+</head>
+<body>
+<link rel="stylesheet" href="../shared/fonts/ledger.css?v=1">
+<style>
+:root{
+  /* White-first ledger: neutral paper and ink, green actions, restrained brass. */
+  color-scheme:light;
+  --bg:#e4e8e0;
+  --surface:#f2f4ec;
+  --surface-2:#eaf0e5;
+  --surface-3:#e7ece5;
+  --line:#e3e6e8;
+  --line-strong:#c9cfd4;
+  --ink:#242a2e;
+  --ink-2:#555f66;
+  --ink-3:#747d85;
+  --accent:#235e49;
+  --accent-hover:#194c3b;
+  --accent-ink:#fffdf7;
+  --accent-soft:#e3eee5;
+  --brass:#9a7b32;
+  --brass-soft:#f3edde;
+  --r0:#194c3b; --r1:#285c45; --r2:#347451; --r3:#4c8c66; --r4:#73a184; --r5:#9fbea6; --r6:#d2e2d4;
+  --k0:#b4315f; --k1:#754100; --k2:#4b9d27; --k3:#0086a1; --k4:#3750bb; --kx:#9aa6b4;
+  --pos:#00876b;
+  --pos-soft:#e3f1ec;
+  --neg:#c62828;
+  --neg-soft:#fbe7e7;
+  --warn:#9c7414;
+  --warn-soft:#f6efdd;
+  --shadow:0 1px 1px rgba(21,62,53,.04), 0 4px 14px -8px rgba(21,62,53,.16);
+  --shadow-lift:0 2px 6px rgba(21,62,53,.08), 0 20px 44px -20px rgba(21,62,53,.34);
+  --focus:#235e49;
+  --r:6px;
+  /* Navigation is another white surface; green is an accent, never a large field. */
+  --rail:#e9eee4;
+  --rail-line:#e3e6e8;
+  --rail-hover:#f5f7f8;
+  --rail-active:#edf4ef;
+  --rail-ink:#242a2e;
+  --rail-ink-2:#616b72;
+  --sans:"Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --serif:"Spectral", "Iowan Old Style", Georgia, "Times New Roman", serif;
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  padding-bottom:env(safe-area-inset-bottom);
+}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer;background:none;border:none}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:4px}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.eyebrow{
+  font-family:var(--mono);font-size:10.5px;font-weight:500;
+  letter-spacing:.11em;text-transform:uppercase;color:var(--ink-3);
+}
+h1,h2,h3{margin:0;text-wrap:balance;font-weight:600;letter-spacing:-.01em}
+.panel-hd h2,.sechead h2,.sheet-hd h2,.empty h3{font-family:var(--serif);font-weight:600;letter-spacing:0}
+
+/* ---------- shell ---------- */
+.app{display:flex;min-height:100vh}
+.rail{
+  width:212px;flex:none;border-right:1px solid var(--rail-line);
+  background:var(--rail);position:sticky;top:0;height:100vh;
+  display:flex;flex-direction:column;gap:1px;padding:22px 12px;
+}
+.brand{
+  display:flex;align-items:baseline;gap:8px;padding:0 10px 16px;margin-bottom:14px;
+  border-bottom:1px solid var(--brass);
+}
+.brand b{font-family:var(--serif);font-size:19px;font-weight:600;letter-spacing:.005em;color:var(--rail-ink)}
+.brand span{font-family:var(--mono);font-size:9.5px;color:var(--brass);letter-spacing:.14em}
+.navbtn{
+  display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:5px;
+  color:var(--rail-ink-2);font-size:14px;font-weight:400;text-align:left;width:100%;
+  transition:background .12s,color .12s;
+}
+.navbtn svg{width:17px;height:17px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.navbtn:hover{background:var(--rail-hover);color:var(--rail-ink)}
+.navbtn[aria-current="page"]{
+  background:var(--rail-active);color:var(--rail-ink);font-weight:600;
+  box-shadow:inset 2px 0 0 var(--brass);
+}
+.rail-foot{margin-top:auto;padding-top:12px;border-top:1px solid var(--rail-line);display:flex;flex-direction:column;gap:6px}
+.sync{font-family:var(--mono);font-size:9.5px;color:var(--rail-ink-2);display:flex;align-items:center;gap:6px;padding:0 11px;letter-spacing:.03em}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--pos);flex:none}
+.dot.off{background:var(--neg)}
+
+main{flex:1;min-width:0}
+.wrap{max-width:1040px;margin:0 auto;padding:26px 28px 64px}
+
+/* ---------- topbar ---------- */
+.topbar{
+  position:sticky;top:0;z-index:30;background:var(--surface);
+  border-bottom:1px solid var(--line);
+}
+.topbar-in{
+  max-width:1040px;margin:0 auto;padding:12px 28px;
+  display:flex;align-items:center;gap:14px;
+}
+.viewname{font-size:17px;font-weight:600;letter-spacing:-.02em;margin-right:auto}
+.all-apps-link{flex:none;white-space:nowrap;border:1px solid #ffffff55;border-radius:8px;padding:7px 10px;color:#f3f6ed;text-decoration:none;font-size:11px;font-weight:600}
+.all-apps-link:hover{background:#ffffff18;color:#fff}
+.monthnav{display:flex;align-items:center;gap:2px;background:var(--surface-3);border-radius:8px;padding:3px}
+.monthnav button{
+  width:28px;height:28px;border-radius:6px;display:grid;place-items:center;color:var(--ink-2);
+}
+.monthnav button:hover:not(:disabled){background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.monthnav button:disabled{opacity:.3;cursor:default}
+.monthnav svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.monthlbl{
+  font-family:var(--mono);font-size:12.5px;font-weight:500;min-width:116px;text-align:center;
+  letter-spacing:.01em;
+}
+.addbtn{
+  background:var(--accent);color:var(--accent-ink);border-radius:8px;
+  padding:8px 14px;font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:6px;
+  transition:background .12s;
+}
+.addbtn:hover{background:var(--accent-hover)}
+.addbtn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round}
+
+/* ---------- primitives ---------- */
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
+.panel-hd{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+.panel-hd h2{font-size:15.5px;font-weight:600}
+.panel-hd .sub{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:auto}
+.stack{display:flex;flex-direction:column;gap:18px}
+.sechead{display:flex;align-items:baseline;gap:12px;margin-bottom:10px}
+.sechead h2{font-size:13px;letter-spacing:.02em}
+
+/* hero */
+.hero{
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  border-top:2px solid var(--brass);
+  box-shadow:var(--shadow);padding:22px 24px;display:grid;
+  grid-template-columns:minmax(0,1fr) auto;gap:22px;align-items:end;
+}
+.hero-net{display:flex;flex-direction:column;gap:6px}
+.hero-fig{font-family:var(--mono);font-size:clamp(34px,6vw,46px);font-weight:600;letter-spacing:-.035em;line-height:1}
+.hero-fig.pos{color:var(--pos)}
+.hero-fig.neg{color:var(--neg)}
+.hero-note{font-size:13px;color:var(--ink-2);max-width:42ch}
+.delta{
+  display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11.5px;font-weight:500;
+  padding:3px 8px;border-radius:99px;white-space:nowrap;
+}
+.delta.good{background:var(--pos-soft);color:var(--pos)}
+.delta.bad{background:var(--neg-soft);color:var(--neg)}
+.delta.flat{background:var(--surface-3);color:var(--ink-3)}
+.dl{font-size:11.5px;color:var(--ink-3);line-height:1.4;display:block;text-wrap:pretty}
+.dl b{font-family:var(--mono);font-weight:500;font-size:11.5px;font-variant-numeric:tabular-nums}
+.hero-split{display:flex;gap:0;align-items:stretch}
+.hsplit{padding:0 18px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:4px;min-width:108px}
+.hsplit:first-child{border-left:none}
+.hsplit b{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:-.02em}
+
+/* tiles */
+.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.tile{
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  padding:13px 15px;display:flex;flex-direction:column;gap:5px;min-width:0;
+}
+.tile b{font-family:var(--mono);font-size:20px;font-weight:600;letter-spacing:-.025em}
+.tile .cap{font-size:11.5px;color:var(--ink-3);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+
+/* charts */
+.chartbox{padding:16px 18px 12px}
+.legend{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.lg{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2)}
+.lg i{width:10px;height:10px;border-radius:2px;display:block}
+svg text{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.tip{
+  position:fixed;z-index:90;pointer-events:none;background:var(--surface);
+  border:1px solid var(--line-strong);border-radius:8px;box-shadow:var(--shadow-lift);
+  padding:9px 11px;font-size:12px;min-width:132px;opacity:0;transition:opacity .1s;
+}
+.tip.on{opacity:1}
+.tip .t-h{font-family:var(--mono);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);margin-bottom:5px}
+.tip .t-r{display:flex;align-items:center;gap:7px;justify-content:space-between}
+.tip .t-r span{display:flex;align-items:center;gap:6px;color:var(--ink-2)}
+.tip .t-r i{width:8px;height:8px;border-radius:2px;display:block}
+.tip .t-r b{font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums}
+
+/* category bars */
+.catlist{display:flex;flex-direction:column}
+.catrow{
+  display:grid;grid-template-columns:148px minmax(0,1fr) 88px;gap:12px;align-items:center;
+  padding:7px 18px;
+}
+.catrow{width:100%;text-align:left;font:inherit;color:inherit}
+.catrow:hover{background:var(--surface-2)}
+.catrow[data-catopen]{cursor:pointer}
+.donut{display:block;margin:0 auto}
+.slicerow{display:grid;grid-template-columns:11px minmax(0,1fr) auto auto;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid var(--line);font-size:13.5px}
+.slicerow:last-child{border-bottom:none}
+.slicerow i{width:11px;height:11px;border-radius:2px;display:block;align-self:center}
+.slicerow .nm2{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.slicerow .nm2 span{display:block;font-size:11px;color:var(--ink-3);white-space:normal}
+.slicerow .amt2{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:500}
+.slicerow .pct{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);min-width:38px;text-align:right}
+.catrow .nm{font-size:13px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.catrow .track{height:9px;background:var(--surface-3);border-radius:3px;overflow:hidden;display:flex;gap:2px}
+.catrow .fill{height:100%;background:var(--accent);border-radius:0 3px 3px 0;min-width:2px}
+.catrow .fill.fixed{background:var(--accent);opacity:.42}
+.catrow .vl{font-family:var(--mono);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
+
+/* tables */
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{
+  font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--ink-3);font-weight:500;text-align:left;padding:9px 14px;border-bottom:1px solid var(--line);
+  white-space:nowrap;
+}
+.tbl td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:13.5px;vertical-align:middle}
+.tbl tr:last-child td{border-bottom:none}
+.tbl .r{text-align:right}
+.tbl tbody tr:hover{background:var(--surface-2)}
+.scroller{overflow-x:auto}
+.chip{
+  display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.05em;
+  padding:2px 7px;border-radius:4px;background:var(--surface-3);color:var(--ink-2);white-space:nowrap;
+}
+.chip.work{background:var(--accent-soft);color:var(--accent)}
+.chip.off{background:var(--neg-soft);color:var(--neg)}
+.iconbtn{
+  width:28px;height:28px;border-radius:6px;display:inline-grid;place-items:center;color:var(--ink-3);
+}
+.iconbtn:hover{background:var(--surface-3);color:var(--ink)}
+.iconbtn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.linkish{color:var(--accent);font-size:12px;font-weight:500;text-decoration:underline;text-underline-offset:2px}
+
+/* ledger rows */
+.daygrp{border-bottom:1px solid var(--line)}
+.daygrp:last-child{border-bottom:none}
+.dayhd{
+  display:flex;align-items:baseline;gap:10px;padding:9px 18px;background:var(--surface-2);
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);
+}
+.dayhd b{margin-left:auto;color:var(--ink-2);font-weight:500;letter-spacing:0}
+.txrow{
+  display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:12px;align-items:center;
+  padding:10px 18px;width:100%;text-align:left;border-bottom:1px solid var(--line);
+}
+.txrow:last-child{border-bottom:none}
+.txrow:hover{background:var(--surface-2)}
+.txrow .mn{min-width:0}
+.txrow .mn b{display:block;font-size:13.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.txrow .mn span{font-size:11.5px;color:var(--ink-3)}
+.txrow .amt{font-family:var(--mono);font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}
+.txrow .amt.inc{color:var(--pos)}
+
+/* empty */
+.empty{padding:38px 24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px}
+.empty p{margin:0;color:var(--ink-3);font-size:13.5px;max-width:44ch}
+.empty h3{font-size:14.5px}
+
+/* report */
+.verdict{
+  font-family:var(--serif);font-size:clamp(20px,3.3vw,26px);line-height:1.4;
+  letter-spacing:-.005em;max-width:32ch;font-weight:400;
+}
+.verdict em{font-style:italic;color:var(--ink-2)}
+.verdict b{font-weight:500;font-family:var(--mono);font-size:.92em;letter-spacing:-.02em}
+.verdict b.pos{color:var(--pos)}
+.verdict b.neg{color:var(--neg)}
+.cmpgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;background:var(--line)}
+.cmpcell{background:var(--surface);padding:14px 16px;display:flex;flex-direction:column;gap:5px}
+.cmpcell b{font-family:var(--mono);font-size:21px;font-weight:600;letter-spacing:-.025em}
+
+/* forms & sheet */
+.scrim{
+  position:fixed;inset:0;z-index:100;background:rgba(8,15,26,.5);
+  display:flex;align-items:flex-end;justify-content:center;
+  opacity:0;pointer-events:none;transition:opacity .16s;
+}
+.scrim.on{opacity:1;pointer-events:auto}
+@supports (backdrop-filter:blur(2px)){.scrim{backdrop-filter:blur(2px)}}
+.sheet{
+  background:var(--surface);width:100%;max-width:460px;border-radius:14px 14px 0 0;
+  border:1px solid var(--line);border-bottom:none;box-shadow:var(--shadow-lift);
+  transform:translateY(14px);transition:transform .18s;
+  max-height:92vh;overflow-y:auto;
+}
+.scrim.on .sheet{transform:translateY(0)}
+@media (min-width:700px){
+  .scrim{align-items:center}
+  .sheet{border-radius:14px;border-bottom:1px solid var(--line)}
+}
+.sheet-hd{
+  display:flex;align-items:center;gap:10px;padding:15px 18px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--surface);z-index:2;
+}
+.sheet-hd h2{font-size:15px;margin-right:auto}
+.sheet-bd{padding:18px;display:flex;flex-direction:column;gap:15px}
+.sheet-ft{
+  padding:14px 18px;border-top:1px solid var(--line);display:flex;gap:10px;
+  position:sticky;bottom:0;background:var(--surface);
+}
+.seg{display:flex;background:var(--surface-3);border-radius:8px;padding:3px;gap:3px}
+.seg button{
+  flex:1;padding:7px 10px;border-radius:6px;font-size:13px;font-weight:500;color:var(--ink-2);
+  transition:background .12s,color .12s;
+}
+.seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:600;box-shadow:var(--shadow)}
+.fld{display:flex;flex-direction:column;gap:6px}
+.fld > label{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+.inp{
+  background:var(--surface-2);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;font-size:14.5px;width:100%;
+}
+.inp:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+select.inp{appearance:none;background-image:none;padding-right:12px}
+.amtwrap{display:flex;align-items:center;gap:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:4px 14px}
+.amtwrap:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.amtwrap span{font-family:var(--mono);font-size:24px;color:var(--ink-3)}
+.amtwrap input{
+  background:none;border:none;outline:none;font-family:var(--mono);font-size:30px;font-weight:600;
+  letter-spacing:-.03em;width:100%;padding:8px 0;
+}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips button{
+  padding:6px 11px;border-radius:99px;font-size:12.5px;border:1px solid var(--line);
+  background:var(--surface-2);color:var(--ink-2);transition:all .12s;
+}
+.chips button:hover{border-color:var(--line-strong)}
+.chips button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:500}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.btn{
+  border-radius:8px;padding:11px 16px;font-size:14px;font-weight:600;
+  border:1px solid var(--line-strong);color:var(--ink-2);background:var(--surface-2);
+}
+.btn:hover{background:var(--surface-3)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);flex:1}
+.btn.pri:hover{background:var(--accent-hover)}
+.btn.danger{color:var(--neg);border-color:transparent;background:transparent;padding:11px 12px}
+.btn.danger:hover{background:var(--neg-soft)}
+.hint{font-size:11.5px;color:var(--ink-3);line-height:1.45}
+.doclist{display:flex;flex-direction:column;gap:6px}
+.doclist:empty{display:none}
+.docrow{
+  display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;align-items:center;
+  background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:7px 9px;
+}
+.docthumb{
+  width:38px;height:38px;border-radius:4px;flex:none;display:grid;place-items:center;overflow:hidden;
+  background:var(--surface-3);border:1px solid var(--line);color:var(--ink-3);text-decoration:none;
+}
+.docthumb img{width:100%;height:100%;object-fit:cover;display:block}
+.docthumb svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.docthumb:hover{border-color:var(--accent);color:var(--accent)}
+.docmeta{min-width:0;display:flex;flex-direction:column;gap:1px}
+.docmeta b{font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.docmeta span{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+.btn.attach{
+  width:100%;border-style:dashed;border-color:var(--line-strong);background:var(--surface-2);
+  color:var(--ink-2);font-weight:500;font-size:13.5px;padding:10px 14px;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+}
+.btn.attach:hover{border-color:var(--accent);color:var(--accent)}
+.btn.attach[disabled]{opacity:.6;cursor:default}
+.btn.attach svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.clip{
+  display:inline-flex;align-items:center;gap:3px;font-family:var(--mono);font-size:10px;
+  color:var(--ink-3);white-space:nowrap;
+}
+.clip svg{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+button.docthumb{padding:0;cursor:zoom-in}
+.docview{display:flex;flex-direction:column;min-height:0}
+.docview-hd{
+  display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:var(--surface);z-index:2;
+}
+.docview-hd b{font-size:13px;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dv-back{
+  display:flex;align-items:center;gap:6px;font-size:13px;font-weight:500;color:var(--accent);
+  padding:5px 9px;border-radius:5px;flex:none;
+}
+.dv-back:hover{background:var(--accent-soft)}
+.dv-back svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.dv-body{padding:14px;background:var(--surface-3);display:flex;flex-direction:column;gap:10px;align-items:center}
+.dv-body img,.dv-body canvas{
+  max-width:100%;height:auto;display:block;border-radius:4px;
+  box-shadow:var(--shadow);background:#fff;
+}
+.dv-body iframe{width:100%;height:70vh;border:0;border-radius:4px;background:#fff}
+.dv-msg{font-size:12.5px;color:var(--ink-2);line-height:1.5;text-align:center;padding:20px 10px;max-width:40ch}
+.err{
+  margin:0;font-size:12.5px;line-height:1.45;color:var(--neg);
+  background:var(--neg-soft);border-radius:8px;padding:9px 12px;
+}
+
+/* reserve meter */
+.meter{height:10px;border-radius:3px;background:var(--surface-3);overflow:hidden;display:flex;gap:2px}
+.meter i{display:block;height:100%}
+.meter i.ship{background:var(--accent);opacity:.45}
+.meter i.other{background:var(--neg)}
+.meter i.left{background:var(--pos);opacity:.22;flex:1}
+.resgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line)}
+.rescell{background:var(--surface);padding:13px 16px;display:flex;flex-direction:column;gap:4px}
+.rescell b{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:-.025em}
+.alert{
+  display:flex;gap:11px;align-items:flex-start;padding:13px 16px;border-radius:var(--r);
+  background:var(--neg-soft);color:var(--neg);font-size:13px;line-height:1.45;
+  border:1px solid transparent;
+}
+.alert.ok{background:var(--pos-soft);color:var(--pos)}
+.alert.warn{background:var(--warn-soft);color:var(--warn)}
+
+/* health */
+.pips{display:flex;gap:3px;height:13px}
+.pips i{flex:1;border-radius:2px;background:var(--surface-3);transition:background .2s}
+.pips i.on{background:currentColor}
+.hpwrap{padding:20px 22px;display:flex;gap:26px;align-items:center;flex-wrap:wrap}
+.hpmain{flex:1 1 260px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.hpfig{display:flex;align-items:baseline;gap:9px}
+.hpfig span:first-child{font-family:var(--mono);font-size:clamp(30px,5vw,40px);font-weight:600;letter-spacing:-.035em;line-height:1}
+.tiername{font-family:var(--serif);font-size:13px;font-weight:600;letter-spacing:.01em;text-transform:none}
+.hpfig span:last-child{font-family:var(--mono);font-size:14px;color:var(--ink-3)}
+.hpdelta{flex:0 0 auto;display:flex;flex-direction:column;gap:4px;padding-left:24px;border-left:1px solid var(--line)}
+.hpdelta b{font-family:var(--mono);font-size:23px;font-weight:600;letter-spacing:-.025em}
+@media (max-width:620px){.hpdelta{padding-left:0;border-left:none;border-top:1px solid var(--line);padding-top:14px;width:100%}}
+.alert svg{width:16px;height:16px;flex:none;margin-top:2px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round}
+.alert b{font-family:var(--mono);font-weight:600}
+
+/* banner */
+.banner{
+  display:flex;gap:10px;align-items:flex-start;padding:11px 14px;border-radius:8px;
+  background:var(--accent-soft);color:var(--accent);font-size:12.5px;line-height:1.45;
+}
+.banner.warn{background:var(--neg-soft);color:var(--neg)}
+.banner svg{width:15px;height:15px;flex:none;margin-top:1px;stroke:currentColor;fill:none;stroke-width:1.8}
+
+/* mobile */
+.tabbar{display:none}
+.fab{display:none}
+@media (max-width:860px){
+  body{padding-bottom:calc(70px + env(safe-area-inset-bottom))}
+  .rail{display:none}
+  .wrap{padding:18px 14px 30px}
+  .topbar-in{padding:10px 14px;gap:10px}
+  .viewname{font-size:15.5px}
+  .addbtn{display:none}
+  .monthlbl{min-width:96px;font-size:12px}
+  .hero{grid-template-columns:1fr;gap:16px;padding:18px}
+  .hero-split{border-top:1px solid var(--line);padding-top:14px}
+  .hsplit{flex:1;min-width:0;padding:0 12px}
+  .hsplit:first-child{padding-left:0}
+  .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .cmpgrid{grid-template-columns:1fr}
+  .catrow{grid-template-columns:112px minmax(0,1fr) 74px;gap:9px;padding:7px 14px}
+  .chartbox{padding:14px 12px 10px}
+  .panel-hd{padding:12px 14px}
+  .txrow,.dayhd{padding-left:14px;padding-right:14px}
+  .tbl th,.tbl td{padding:9px 10px}
+  .tabbar{
+    display:grid;grid-template-columns:repeat(8,1fr);position:fixed;bottom:0;left:0;right:0;z-index:40;
+    background:var(--rail);border-top:1px solid var(--rail-line);
+    padding:6px 4px calc(6px + env(safe-area-inset-bottom));
+  }
+  .tabbar button{
+    display:flex;flex-direction:column;align-items:center;gap:3px;padding:5px 1px;border-radius:8px;
+    font-size:8px;font-weight:400;color:var(--rail-ink-2);letter-spacing:-.02em;
+    min-width:0;overflow:hidden;
+  }
+  .tabbar button svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+  .tabbar button[aria-current="page"]{color:var(--rail-ink);font-weight:600;box-shadow:inset 0 2px 0 var(--brass)}
+  .fab{
+    display:grid;place-items:center;position:fixed;z-index:45;
+    right:16px;bottom:calc(80px + env(safe-area-inset-bottom));
+    width:54px;height:54px;border-radius:50%;background:var(--accent);color:var(--accent-ink);
+    box-shadow:var(--shadow-lift);
+  }
+  .fab svg{width:23px;height:23px;stroke:currentColor;fill:none;stroke-width:2.4;stroke-linecap:round}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important;animation:none!important}
+}
+  /* A dark green header anchors soft, white-dominant paper surfaces. */
+.topbar{background:#214c3b;border-bottom-color:#173c2d;color:#f3f6ed}
+.topbar .viewname{color:#f3f6ed}
+.topbar .monthnav{background:#ffffff12}
+.topbar .monthnav button{color:#d9e4d7}
+.topbar .monthnav button:hover:not(:disabled){background:#ffffff20;color:#fff}
+.topbar .monthlbl{color:#f3f6ed}
+.topbar .addbtn{background:#eef3e7;color:#214c3b}
+.panel-hd h2,.sechead h2,.brand b{color:#214c3b}
+</style>
+
+<div class="app">
+  <nav class="rail" aria-label="Sections">
+    <div class="brand"><b>Ledger</b><span>EUR</span></div>
+    <button class="navbtn" data-nav="overview" aria-current="page"><svg viewBox="0 0 24 24"><path d="M3 13h6v8H3zM9.5 3h5v18h-5zM15 9h6v12h-6z"/></svg>Overview</button>
+    <button class="navbtn" data-nav="ledger"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>Ledger</button>
+    <button class="navbtn" data-nav="extra"><svg viewBox="0 0 24 24"><path d="M12 2 3 13h7l-1 9 12-13h-7l1-7z"/></svg>Extraordinary</button>
+    <button class="navbtn" data-nav="ship"><svg viewBox="0 0 24 24"><path d="M3.4 16.5h17.2l-2.1 4a1.3 1.3 0 01-1.1.7H6.6a1.3 1.3 0 01-1.1-.7z"/><path d="M12 16.5V2.4"/><path d="M13.3 4.6L18.2 14.5H13.3z"/><path d="M10.7 7.2L6.4 14.5h4.3z"/></svg>Shipwrighting</button>
+    <button class="navbtn" data-nav="subs"><svg viewBox="0 0 24 24"><path d="M12 3v18M8 7h6a3 3 0 010 6H9a3 3 0 000 6h7"/></svg>Subscriptions</button>
+    <button class="navbtn" data-nav="housing"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9a1 1 0 01-1 1H5a1 1 0 01-1-1z"/><path d="M10 21v-6h4v6"/></svg>Housing</button>
+    <button class="navbtn" data-nav="report"><svg viewBox="0 0 24 24"><path d="M4 18V9M9 18V5M14 18v-6M19 18v-9"/><path d="M3 21h18"/></svg>Weekly report</button>
+    <div class="rail-foot">
+      <button class="navbtn" id="bkBtn" style="font-size:13px"><svg viewBox="0 0 24 24"><path d="M4 7v12a1 1 0 001 1h14a1 1 0 001-1V7"/><path d="M2 7h20l-2-3H4z"/><path d="M10 12h4"/></svg>Backup</button>
+      <button class="navbtn" id="cfgBtn" style="font-size:13px"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H3a2 2 0 110-4h.1a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>Salary &amp; reserve</button>
+      <div class="sync"><i class="dot" id="syncdot"></i><span id="syncmsg">Connecting…</span></div>
+    </div>
+  </nav>
+
+  <main>
+    <header class="topbar">
+      <div class="topbar-in">
+        <h1 class="viewname" id="viewname">Overview</h1>
+        <div class="monthnav" id="monthnav">
+          <button id="mprev" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+          <span class="monthlbl" id="mlbl">—</span>
+          <button id="mnext" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
+        </div>
+        <button class="addbtn" id="addTop"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add entry</button>
+        <a class="all-apps-link" href="../" aria-label="Return to all your apps">← All apps</a>
+      </div>
+    </header>
+    <div class="wrap"><div id="view" class="stack"></div></div>
+  </main>
+</div>
+
+<nav class="tabbar" aria-label="Sections">
+  <button data-nav="overview" aria-current="page"><svg viewBox="0 0 24 24"><path d="M3 13h6v8H3zM9.5 3h5v18h-5zM15 9h6v12h-6z"/></svg>Overview</button>
+  <button data-nav="ledger"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>Ledger</button>
+  <button data-nav="extra"><svg viewBox="0 0 24 24"><path d="M12 2 3 13h7l-1 9 12-13h-7l1-7z"/></svg>Extra</button>
+  <button data-nav="ship"><svg viewBox="0 0 24 24"><path d="M3.4 16.5h17.2l-2.1 4a1.3 1.3 0 01-1.1.7H6.6a1.3 1.3 0 01-1.1-.7z"/><path d="M12 16.5V2.4"/><path d="M13.3 4.6L18.2 14.5H13.3z"/><path d="M10.7 7.2L6.4 14.5h4.3z"/></svg>Ships</button>
+  <button data-nav="subs"><svg viewBox="0 0 24 24"><path d="M12 3v18M8 7h6a3 3 0 010 6H9a3 3 0 000 6h7"/></svg>Subs</button>
+  <button data-nav="housing"><svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9a1 1 0 01-1 1H5a1 1 0 01-1-1z"/><path d="M10 21v-6h4v6"/></svg>Housing</button>
+  <button data-nav="report"><svg viewBox="0 0 24 24"><path d="M4 18V9M9 18V5M14 18v-6M19 18v-9"/><path d="M3 21h18"/></svg>Report</button>
+  <button id="moreBtn"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>More</button>
+</nav>
+<button class="fab" id="fab" aria-label="Add entry"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+
+<div class="scrim" id="scrim"><div class="sheet" id="sheet" role="dialog" aria-modal="true"></div></div>
+<div class="tip" id="tip" role="status"></div>
+
+<script>
+/* ============================ constants ============================ */
+const EXP_CATS = [
+  ['housing',      'Housing & utilities'],
+  ['food',         'Groceries'],
+  ['dining',       'Dining & delivery'],
+  ['transport',    'Transport'],
+  ['work',         'Work & research'],
+  ['health',       'Health'],
+  ['reading',      'Books & press'],
+  ['entertainment','Entertainment'],
+  ['ship',         'Model shipwrighting'],
+  ['games',        'Games & hobbies'],
+  ['shopping',     'Shopping'],
+  ['travel',       'Travel'],
+  ['admin',        'Bank, tax & admin'],
+  ['other',        'Other'],
+];
+const INC_CATS = [
+  ['salary','Salary'], ['grant','Grant / stipend'], ['freelance','Freelance'],
+  ['reimb','Reimbursement'], ['gift','Gift'], ['other-in','Other income'],
+];
+const SHIP_SUBS = [
+  ['ships',  'Ships & kits'],
+  ['paints', 'Paints & pieces'],
+  ['tools',  'Tools'],
+  ['books',  'Naval history books'],
+];
+const SHIPNAME = Object.fromEntries(SHIP_SUBS);
+const CATNAME = Object.fromEntries([...EXP_CATS, ...INC_CATS]);
+CATNAME.extra = 'Extraordinary';
+const DEFAULT_SETTINGS = { baselineIncome: 1500, reserveStart: 10000, reserveAsOf: '',
+                           hpMax: 1500, hpIgnoreShip: false,
+                           salary: 1500, salaryOn: true, salaryFrom: '' };
+const WORK_CATS = new Set(['work']);
+const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MON3 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+/* ============================ helpers ============================ */
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+/* ---- documents attached to an entry (the `assets` store) ---- */
+let ASSETS = null;
+const ASSET_TYPES = new Set(['image/png','image/jpeg','image/gif','image/webp','application/pdf']);
+const EXT_TYPE = { png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
+                   webp:'image/webp', pdf:'application/pdf' };
+const assetUrl = (id) => '/_blob/' + id;
+const ICON_PDF  = '<svg viewBox="0 0 24 24"><path d="M14 3H7a1 1 0 00-1 1v16a1 1 0 001 1h10a1 1 0 001-1V7z"/><path d="M14 3v4h4"/></svg>';
+const ICON_CLIP = '<svg viewBox="0 0 24 24"><path d="M21 11.5l-8.4 8.4a5 5 0 01-7-7l8.4-8.4a3.3 3.3 0 014.7 4.7l-8.4 8.4a1.7 1.7 0 01-2.4-2.4l7.8-7.8"/></svg>';
+
+function fileSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB';
+  return (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + ' MB';
+}
+function assetMessage(code, name) {
+  switch (code) {
+    case 'too_large':        return `"${name}" is too big — 20 MB is the limit. Photograph it instead of scanning at full resolution.`;
+    case 'unsupported_type': return `"${name}" isn't a kind of file that can be attached. Photos (JPG, PNG, WEBP) and PDFs only — a Word or Excel file has to be exported to PDF first.`;
+    case 'quota_or_state':   return 'The document store is full. Remove an attachment you no longer need, then try again.';
+    case 'rate_limited':     return 'Too many uploads at once. Wait a few seconds and try again.';
+    case 'upstream_auth':    return 'Your session expired. Reload the page and try again.';
+    case 'invalid_request':  return `"${name}" could not be read. If it is a photo, try re-saving it as JPG.`;
+    default:                 return `"${name}" could not be attached. Try again in a moment.`;
+  }
+}
+/* The viewer sandbox makes plain file links inert — a new tab opens empty — so
+   documents are rendered inside the page. Images go straight into an <img>;
+   PDFs are drawn to a canvas with pdf.js, fetched from cnjs only the first
+   time a PDF is actually opened. */
+let pdfLib = null;
+function loadPdfLib() {
+  if (pdfLib) return pdfLib;
+  pdfLib = new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = 'vendor/pdf.min.js';
+    el.onload = () => {
+      const lib = window.pdfjsLib;
+      if (!lib) return reject(new Error('pdfjs missing'));
+      try {
+        lib.GlobalWorkerOptions.workerSrc =
+          'vendor/pdf.worker.min.js';
+      } catch (e) { /* pdf.js falls back to the main thread */ }
+      resolve(lib);
+    };
+    el.onerror = () => reject(new Error('pdfjs failed to load'));
+    document.head.appendChild(el);
+  });
+  return pdfLib;
+}
+async function renderPdf(url, box) {
+  const lib = await loadPdfLib();
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('http ' + res.status);
+  const data = await res.arrayBuffer();
+  const pdf = await lib.getDocument({ data }).promise;
+  const width = Math.max(240, box.clientWidth - 28);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  box.innerHTML = '';
+  for (let i = 1; i <= Math.min(pdf.numPages, 25); i++) {
+    const page = await pdf.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: (width / base.width) * dpr });
+    const c = document.createElement('canvas');
+    c.width = vp.width; c.height = vp.height;
+    c.style.width = '100%';
+    box.appendChild(c);
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+  }
+  if (pdf.numPages > 25) {
+    const p = document.createElement('p');
+    p.className = 'dv-msg';
+    p.textContent = `Showing the first 25 of ${pdf.numPages} pages.`;
+    box.appendChild(p);
+  }
+}
+
+/** Show one attachment inside the sheet, over the form, and come back to it. */
+function openDocViewer(sheet, doc) {
+  const others = [...sheet.children].filter(el => !el.classList.contains('docview'));
+  let view = sheet.querySelector('.docview');
+  if (!view) {
+    view = document.createElement('div');
+    view.className = 'docview';
+    view.innerHTML = `<div class="docview-hd">
+        <button type="button" class="dv-back"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>Back</button>
+        <b class="dv-name"></b></div>
+      <div class="dv-body"></div>`;
+    sheet.appendChild(view);
+    view.querySelector('.dv-back').addEventListener('click', () => {
+      view.hidden = true;
+      view.querySelector('.dv-body').innerHTML = '';
+      others.forEach(el => { el.hidden = el.dataset.wasHidden === '1'; });
+    });
+  }
+  others.forEach(el => { el.dataset.wasHidden = el.hidden ? '1' : '0'; el.hidden = true; });
+  view.hidden = false;
+  view.querySelector('.dv-name').textContent = doc.name;
+  const body = view.querySelector('.dv-body');
+  const url = assetUrl(doc.id);
+  body.innerHTML = '<p class="dv-msg">Opening…</p>';
+
+  if ((doc.type || '').startsWith('image/')) {
+    const img = new Image();
+    img.alt = doc.name;
+    img.onload = () => { body.innerHTML = ''; body.appendChild(img); };
+    img.onerror = () => { body.innerHTML = '<p class="dv-msg">This file is no longer in the store. Remove the attachment and add it again.</p>'; };
+    img.src = url;
+    return;
+  }
+  renderPdf(url, body).catch(() => {
+    // last resort: let the browser try its own PDF viewer
+    body.innerHTML = `<iframe src="${url}" title="${esc(doc.name)}"></iframe>
+      <p class="dv-msg">If this stays blank, the PDF cannot be previewed here — the file is still stored and attached.</p>`;
+  });
+}
+
+/** Normalise what the file picker gives us: settle the media type, and shrink
+ *  big photos so a year of receipts does not exhaust the store. */
+async function prepareFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  let type = ASSET_TYPES.has(file.type) ? file.type : (EXT_TYPE[ext] || '');
+  const isImage = type.startsWith('image/') || (file.type || '').startsWith('image/');
+  if (type === 'application/pdf') return { blob: file, type, name: file.name };
+
+  if (isImage || !type) {
+    // Re-encode through a canvas: settles odd camera formats (HEIC on Apple
+    // devices) and caps the long edge. Skip it for small, already-valid files.
+    if (type && type !== 'image/gif' && file.size < 1_200_000) return { blob: file, type, name: file.name };
+    try {
+      const bmp = await createImageBitmap(file);
+      const max = 2400, scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      bmp.close && bmp.close();
+      const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+      if (blob) return { blob, type: 'image/jpeg', name: file.name.replace(/\.[^.]+$/, '') + '.jpg' };
+    } catch (e) { /* fall through to the raw file */ }
+  }
+  if (!ASSET_TYPES.has(type)) { const e = new Error('unsupported'); e.code = 'unsupported_type'; throw e; }
+  return { blob: file, type, name: file.name };
+}
+
+/** Snapshots from the store are frozen. Take a mutable copy before it goes in state. */
+function thaw(v) {
+  try { return structuredClone(v); }
+  catch (e) { try { return JSON.parse(JSON.stringify(v)); } catch (e2) { return v; } }
+}
+
+function fmt(n, cents = false) {
+  const neg = n < -0.004;
+  const v = Math.abs(n).toLocaleString('en-US', {
+    minimumFractionDigits: cents ? 2 : 0, maximumFractionDigits: cents ? 2 : 0,
+  });
+  return (neg ? '−' : '') + '€' + v;
+}
+const fmtSigned = (n, cents=false) => (n > 0.004 ? '+' : '') + fmt(n, cents);
+
+const pad2 = (n) => String(n).padStart(2, '0');
+const iso = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+const mKey = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}`;
+const parseISO = (s) => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d||1); };
+const monthLabel = (mk, short=false) => {
+  const [y,m] = mk.split('-').map(Number);
+  return `${(short?MON3:MONTHS)[m-1]} ${y}`;
+};
+function addMonths(mk, n) {
+  const [y,m] = mk.split('-').map(Number);
+  const d = new Date(y, m-1+n, 1);
+  return mKey(d);
+}
+function monthsBetween(a, b) { // inclusive count of months from mk a to mk b
+  const [ay,am] = a.split('-').map(Number), [by,bm] = b.split('-').map(Number);
+  return (by-ay)*12 + (bm-am) + 1;
+}
+function startOfWeek(d) {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  x.setDate(x.getDate() - ((x.getDay()+6) % 7));
+  return x;
+}
+function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate()+n); return x; }
+function weekLabel(ws) {
+  const we = addDays(ws, 6);
+  const a = `${ws.getDate()} ${MON3[ws.getMonth()]}`;
+  const b = `${we.getDate()} ${MON3[we.getMonth()]}`;
+  return ws.getMonth() === we.getMonth() ? `${ws.getDate()}–${b}` : `${a} – ${b}`;
+}
+function humanDuration(months) {
+  if (months < 1) return 'under a month';
+  const y = Math.floor(months/12), m = months % 12;
+  if (!y) return `${m} mo`;
+  if (!m) return `${y} yr`;
+  return `${y} yr ${m} mo`;
+}
+
+/* ============================ state ============================ */
+const TODAY = new Date();
+const THIS_MONTH = mKey(TODAY);
+const LS = 'householdLedger.v1';
+
+const state = {
+  months: {},      // "YYYY-MM" -> { month, tx: [...] }
+  recurring: [],   // recurring commitments (subscriptions + housing)
+  settings: {},    // baseline income, reserve size, reserve start month
+  schedule: [],    // automated email reports Claude has set up for this app
+  view: 'overview',
+  cursor: THIS_MONTH,
+  weekCursor: iso(startOfWeek(TODAY)),
+};
+const cfg = () => {
+  const c = { ...DEFAULT_SETTINGS, ...(state.settings || {}) };
+  if (!c.reserveAsOf) c.reserveAsOf = THIS_MONTH;
+  return c;
+};
+let DB = null, DOWNLOADS = null;
+/** Hand a file to the browser, wherever the page happens to be running. */
+async function offer(filename, text) {
+  if (!DOWNLOADS) {
+    alert('Saving files is not available in this view. Open the installed app, or use the app on a computer.');
+    return;
+  }
+  try { await DOWNLOADS.save({ filename, data: text }); }
+  catch (e) {
+    const code = e && e.code;
+    if (code === 'declined') return;
+    alert(code === 'too_large' ? 'That file is too large to save.'
+      : code === 'rate_limited' ? 'A save prompt is already open — try again in a moment.'
+      : 'The file could not be saved here.');
+  }
+}
+
+function cacheLocal() {
+  try { localStorage.setItem(LS, JSON.stringify({ months: state.months, recurring: state.recurring, settings: state.settings, schedule: state.schedule })); } catch (e) {}
+}
+function loadLocal() {
+  try {
+    const raw = localStorage.getItem(LS);
+    if (!raw) return false;
+    const d = JSON.parse(raw);
+    state.months = d.months || {};
+    state.recurring = d.recurring || [];
+    state.settings = d.settings || {};
+    state.schedule = d.schedule || [];
+    return true;
+  } catch (e) { return false; }
+}
+
+function setSync(msg, bad) {
+  const dot = $('#syncdot'), m = $('#syncmsg');
+  if (dot) dot.className = 'dot' + (bad ? ' off' : '');
+  if (m) m.textContent = msg;
+}
+
+async function persistMonth(mk) {
+  cacheLocal();
+  if (!DB) return;
+  try {
+    await DB.doc('ledger/' + mk).set({ month: mk, tx: state.months[mk]?.tx || [] });
+    setSync('Synced');
+  } catch (e) { setSync('Offline — saved locally', true); }
+}
+async function persistSettings() {
+  cacheLocal();
+  if (!DB) return;
+  try { await DB.doc('config/settings').set(state.settings); setSync('Synced'); }
+  catch (e) { setSync('Offline — saved locally', true); }
+}
+async function persistRecurring() {
+  cacheLocal();
+  if (!DB) return;
+  try {
+    await DB.doc('config/recurring').set({ items: state.recurring });
+    setSync('Synced');
+  } catch (e) { setSync('Offline — saved locally', true); }
+}
+
+/* ============================ computation ============================ */
+/* A recurring item normally costs the same every month. One with a `schedule`
+   — a rent on a payment plan, say — carries its own figure for named months;
+   anything outside the schedule falls back to the plain amount. */
+const schedFor = (it, mk) => {
+  const v = it && it.schedule && mk ? Number(it.schedule[mk]) : NaN;
+  return isFinite(v) ? v : null;
+};
+const hasSchedule = (it) => !!(it && it.schedule && Object.keys(it.schedule).length);
+const monthlyEq = (it, mk) => {
+  const v = schedFor(it, mk);
+  if (v !== null) return v;
+  return it.basis === 'yearly' ? it.amount / 12 : it.amount;
+};
+const yearlyEq = (it, mk) => {
+  if (!hasSchedule(it)) return it.basis === 'yearly' ? it.amount : it.amount * 12;
+  // the twelve months from the one on screen, so the figure follows the plan
+  let sum = 0, k = mk || THIS_MONTH;
+  for (let i = 0; i < 12; i++) { if (activeIn(it, k)) sum += monthlyEq(it, k); k = addMonths(k, 1); }
+  return sum;
+};
+/** Months a schedule names, in order. */
+const schedMonths = (it) => Object.keys((it && it.schedule) || {}).sort();
+
+function activeIn(it, mk) {
+  if (it.since && mk < it.since) return false;
+  if (it.status === 'active') return true;
+  if (it.ended) return mk <= it.ended;
+  return false;
+}
+const txOf = (mk) => state.months[mk]?.tx || [];
+
+function monthStats(mk) {
+  const c0 = cfg();
+  const salary = (c0.salaryOn && (!c0.salaryFrom || mk >= c0.salaryFrom)) ? Number(c0.salary) || 0 : 0;
+  const tx = txOf(mk);
+  let income = salary, variable = 0, extraordinary = 0, ordinaryCount = 0;
+  const byCat = {};
+  const ship = { total: 0, ships: 0, paints: 0, tools: 0, books: 0 };
+  for (const t of tx) {
+    const a = Number(t.a) || 0;
+    if (t.t === 'inc') { income += a; continue; }
+    if (t.t === 'extra') { extraordinary += a; continue; }
+    variable += a;
+    ordinaryCount++;
+    byCat[t.c] = byCat[t.c] || { variable: 0, fixed: 0 };
+    byCat[t.c].variable += a;
+    if (t.c === 'ship') {
+      ship.total += a;
+      ship[Object.prototype.hasOwnProperty.call(SHIPNAME, t.sc) ? t.sc : 'ships'] += a;
+    }
+  }
+  let subs = 0, housing = 0, recurringIncome = 0;
+  for (const it of state.recurring) {
+    if (!activeIn(it, mk)) continue;
+    const m = monthlyEq(it, mk);
+    // money coming in every month is income, not a category of spending
+    if (it.kind === 'income') { recurringIncome += m; income += m; continue; }
+    if (it.kind === 'housing') housing += m; else subs += m;
+    byCat[it.category] = byCat[it.category] || { variable: 0, fixed: 0 };
+    byCat[it.category].fixed += m;
+    if (it.category === 'ship') { ship.total += m; ship.ships += m; }
+  }
+  const fixed = subs + housing;
+  const spend = variable + extraordinary + fixed;
+  return { mk, income, salary, recurringIncome, extraIncome: income - salary, variable, subs, housing, fixed,
+           extraordinary, ordinarySpend: variable + fixed, ordinaryCount,
+           spend, net: income - spend, byCat, ship, count: tx.length };
+}
+
+/** Variable spending between two dates (inclusive), scanning the months they touch. */
+function variableBetween(from, to) {
+  let sum = 0;
+  const keys = new Set([mKey(from), mKey(to)]);
+  for (const mk of keys) {
+    for (const t of txOf(mk)) {
+      if (t.t !== 'exp') continue;
+      const d = parseISO(t.d);
+      if (d >= from && d <= to) sum += Number(t.a) || 0;
+    }
+  }
+  return sum;
+}
+
+/** Every entry falling in a week (inclusive), tagged with the month it lives in so it can be edited. */
+function weekTx(ws) {
+  const we = addDays(ws, 6);
+  const out = [];
+  const keys = new Set([mKey(ws), mKey(we)]);
+  for (const mk of keys) {
+    for (const t of txOf(mk)) {
+      const d = parseISO(t.d);
+      if (d >= ws && d <= we) out.push({ ...t, mk });
+    }
+  }
+  return out;
+}
+/** Logged spending for a week, grouped by category. */
+function weekCatRows(tx) {
+  const totals = {};
+  for (const t of tx) {
+    if (t.t === 'inc') continue;
+    const cat = t.t === 'extra' ? 'extra' : t.c;
+    totals[cat] = (totals[cat] || 0) + (Number(t.a) || 0);
+  }
+  return Object.entries(totals).map(([c, v]) => ({ c, v }))
+    .filter(r => r.v > 0.004).sort((a, b) => b.v - a.v);
+}
+
+const daysInMonth = (mk) => { const [y, m] = mk.split('-').map(Number); return new Date(y, m, 0).getDate(); };
+const elapsedDays = (mk) => (mk === THIS_MONTH ? TODAY.getDate() : (mk < THIS_MONTH ? daysInMonth(mk) : 0));
+
+/**
+ * The reserve. Each month, spending above what that month's income covers
+ * (the €1,500 baseline, or more when more was actually logged) comes out of
+ * the €10,000 pot. Shipwrighting is counted against the overrun first — it is
+ * the deliberate draw — so whatever is left over is the unplanned part.
+ * Surpluses are never credited back: the pot only shrinks.
+ */
+function reserveState() {
+  const c = cfg();
+  const rows = [];
+  let mk = c.reserveAsOf > THIS_MONTH ? THIS_MONTH : c.reserveAsOf;
+  for (let guard = 0; mk <= THIS_MONTH && guard < 600; guard++, mk = addMonths(mk, 1)) {
+    const st = monthStats(mk);
+    const capacity = Math.max(c.baselineIncome, st.income);
+    const draw = Math.max(0, st.spend - capacity);
+    const shipDraw = Math.min(st.ship.total, draw);
+    const ordinaryDraw = Math.max(0, st.ordinarySpend - capacity);
+    const extraordinaryDraw = Math.max(0, draw - ordinaryDraw);
+    rows.push({ mk, st, capacity, draw, ordinaryDraw, extraordinaryDraw, shipDraw, other: draw - shipDraw, headroom: capacity - st.spend });
+  }
+  const drawn = rows.reduce((a, r) => a + r.draw, 0);
+  const shipDrawn = rows.reduce((a, r) => a + r.shipDraw, 0);
+  return {
+    c, rows, drawn, shipDrawn, otherDrawn: drawn - shipDrawn,
+    ordinaryDrawn: rows.reduce((sum, r) => sum + r.ordinaryDraw, 0),
+    extraordinaryDrawn: rows.reduce((sum, r) => sum + r.extraordinaryDraw, 0),
+    remaining: c.reserveStart - drawn,
+    current: rows.find(r => r.mk === THIS_MONTH) || rows[rows.length - 1] || null,
+  };
+}
+
+const HP_TIERS = [
+  [1.00, 'Full sail',    'pos'],
+  [0.75, 'Shipshape',    'pos'],
+  [0.50, 'Seaworthy',    'pos'],
+  [0.25, 'Taking water', 'warn'],
+  [0.001,'Foundering',   'neg'],
+  [-1,   'Sunk',         'neg'],
+];
+/**
+ * Health points. You start at full. A month that spends past what your income
+ * covers costs a point per euro; a month that comes in under heals you back by
+ * the same rule — never above the maximum, never below zero. Clamped month by
+ * month in order, so one frugal month cannot bank credit against a future blowout.
+ */
+function healthState() {
+  const c = cfg(), r = reserveState(), max = Math.max(1, c.hpMax);
+  let hp = max;
+  const rows = [];
+  for (const row of r.rows) {
+    const spend = row.st.ordinarySpend - (c.hpIgnoreShip ? row.st.ship.total : 0);
+    const delta = row.capacity - spend;
+    const before = hp;
+    hp = Math.max(0, Math.min(max, hp + delta));
+    rows.push({ mk: row.mk, delta, before, after: hp, applied: hp - before });
+  }
+  const pct = hp / max;
+  const t = HP_TIERS.find(x => pct >= x[0]) || HP_TIERS[HP_TIERS.length - 1];
+  return { hp, max, pct, tier: { name: t[1], col: t[2] }, rows, c,
+           cur: rows.length ? rows[rows.length - 1] : null };
+}
+/** What a projected month-end total would do to health. */
+function hpAfter(h, capacity, projectedSpend) {
+  const prev = h.rows.length ? h.rows[h.rows.length - 1].before : h.max;
+  return Math.max(0, Math.min(h.max, prev + (capacity - projectedSpend)));
+}
+
+/** Everything spent on model shipwrighting in a calendar year. */
+function shipYear(year) {
+  const out = { total: 0, ships: 0, paints: 0, tools: 0, books: 0, months: [] };
+  for (let m = 1; m <= 12; m++) {
+    const mk = `${year}-${pad2(m)}`;
+    const st = monthStats(mk);
+    if (!state.months[mk] && mk > THIS_MONTH) continue;
+    out.months.push({ mk, v: st.ship.total });
+    for (const k of ['total', 'ships', 'paints', 'tools', 'books']) out[k] += st.ship[k];
+  }
+  return out;
+}
+
+/**
+ * Month-end forecast built from your own daily spend rates. Baseline uses the
+ * median rate of complete months, optimistic the calmest, pessimistic the
+ * busiest; the current month's own rate is folded in so a hot month is not
+ * forecast as if it were quiet.
+ */
+function forecast() {
+  const c = cfg();
+  const st = monthStats(THIS_MONTH);
+  const dim = daysInMonth(THIS_MONTH), day = TODAY.getDate(), left = Math.max(0, dim - day);
+
+  const hist = [];
+  for (let i = 1; i <= 6; i++) {
+    const mk = addMonths(THIS_MONTH, -i);
+    const h = monthStats(mk);
+    if (h.ordinaryCount > 0) hist.push(h.variable / daysInMonth(mk));
+  }
+  const rateNow = day > 0 ? st.variable / day : 0;
+  const ready = hist.length >= 1 || (day >= 10 && st.ordinaryCount >= 5);
+  if (!ready) {
+    return { ready: false, need: hist.length ? '' : 'a full month of logged entries', day, dim, st, c };
+  }
+  const pool = hist.length ? [...hist, rateNow] : [rateNow];
+  const sorted = [...pool].sort((a, b) => a - b);
+  const median = sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length/2 - 1] + sorted[sorted.length/2]) / 2;
+  const mk = (rate) => st.variable + rate * left + st.fixed + st.extraordinary;
+
+  const capacity = Math.max(c.baselineIncome, st.income);
+  const h = healthState();
+  const hpNow = h.rows.length ? h.rows[h.rows.length - 1].before : h.max;
+  const scen = [
+    { key: 'opt',  name: 'Calm',       note: 'your quietest recent pace', total: mk(sorted[0]) },
+    { key: 'base', name: 'Likely',     note: 'your usual pace',           total: mk(median) },
+    { key: 'pess', name: 'Busy',       note: 'your heaviest recent pace', total: mk(sorted[sorted.length - 1]) },
+  ].map(x => ({
+    ...x,
+    draw: Math.max(0, x.total - capacity),
+    net: st.income - x.total,
+    hp: hpAfter(h, capacity, x.total - st.extraordinary - (c.hpIgnoreShip ? st.ship.total : 0)),
+    hpNow,
+  }));
+
+  const allowance = left > 0 ? Math.max(0, capacity - st.spend) / left : 0;
+  return { ready: true, scen, capacity, allowance, left, day, dim, st, c, rateNow, median };
+}
+
+function recentMonths(n, endMk = state.cursor) {
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) out.push(addMonths(endMk, -i));
+  return out;
+}
+const subsOf  = (kind) => state.recurring.filter(i => i.kind === kind);
+const isWork  = (it) => WORK_CATS.has(it.category);
+
+/* ============================ charts ============================ */
+const TIP = () => $('#tip');
+function showTip(html, ev) {
+  const t = TIP();
+  t.innerHTML = html;
+  t.classList.add('on');
+  const r = t.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY - r.height - 12;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y < 8) y = ev.clientY + 18;
+  t.style.left = x + 'px';
+  t.style.top = y + 'px';
+}
+const hideTip = () => TIP().classList.remove('on');
+
+function niceMax(v) {
+  if (v <= 0) return 100;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  return Math.ceil(v / (p/2)) * (p/2);
+}
+function barPath(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w/2, h));
+  return `M${x} ${y+h}L${x} ${y+r}Q${x} ${y} ${x+r} ${y}L${x+w-r} ${y}Q${x+w} ${y} ${x+w} ${y+r}L${x+w} ${y+h}Z`;
+}
+
+/**
+ * Six months of spending, each bar stacked by category.
+ *
+ * Categories are ranked over the whole window so a colour means the same thing
+ * in every column; beyond the fifth they gather into one neutral band, because
+ * a dozen hues cannot be told apart — least of all by a colour-blind reader.
+ * A green tick above each bar marks that month's income, so the question the
+ * chart answers is whether the stack cleared it.
+ */
+function catRanking(rows) {
+  const totals = {};
+  for (const r of rows) {
+    for (const [c, v] of Object.entries(r.s.byCat)) totals[c] = (totals[c] || 0) + v.variable + v.fixed;
+  }
+  const ranked = Object.entries(totals).filter(([, v]) => v > 0.004).sort((a, b) => b[1] - a[1]);
+  const top = ranked.slice(0, 5).map(([c]) => c);
+  const tail = ranked.slice(5).map(([c]) => c);
+  return { top, tail, series: [...top, ...(tail.length ? ['__other'] : [])] };
+}
+const catColour = (c, i) => (c === '__other' ? 'var(--kx)' : `var(--k${i})`);
+const catLabel = (c, tail) => (c === '__other' ? `${tail.length} smaller categories` : (CATNAME[c] || c));
+const catValue = (r, c, tail) => (c === '__other'
+  ? tail.reduce((a, cc) => a + ((r.s.byCat[cc]?.variable || 0) + (r.s.byCat[cc]?.fixed || 0)), 0)
+  : (r.s.byCat[c]?.variable || 0) + (r.s.byCat[c]?.fixed || 0));
+
+function chartMonths(keys) {
+  const rows = keys.map(k => ({ k, s: monthStats(k) }));
+  const { top, tail, series } = catRanking(rows);
+  const max = niceMax(Math.max(1, ...rows.flatMap(r => [r.s.income, r.s.spend])));
+
+  function build(W) {
+    const H = 210, L = 46, R = 14, T = 24, B = 30;
+    const pw = W - L - R, ph = H - T - B;
+    const gw = pw / rows.length, bw = Math.max(14, Math.min(42, gw * 0.52));
+    const y = v => T + ph - (v / max) * ph;
+    let grid = '';
+    for (const tv of [0, max / 2, max]) {
+      grid += `<line x1="${L}" x2="${W-R}" y1="${y(tv).toFixed(1)}" y2="${y(tv).toFixed(1)}" style="stroke:var(--line)" stroke-width="1"/>`;
+      grid += `<text x="${L-9}" y="${(y(tv)+3.5).toFixed(1)}" text-anchor="end" font-size="10" style="fill:var(--ink-3)">${fmt(tv)}</text>`;
+    }
+    let bars = '', marks = '', labels = '', hit = '';
+    rows.forEach((r, i) => {
+      const cx = L + gw * i + gw / 2, x = cx - bw / 2;
+      let acc = 0;
+      series.forEach((c, k) => {
+        const v = catValue(r, c, tail);
+        if (v <= 0.004) return;
+        const yTop = y(acc + v), yBot = y(acc);
+        const h = Math.max(1, yBot - yTop - (acc > 0 ? 2 : 0));
+        bars += `<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}"
+          style="fill:${catColour(c, k)}"/>`;
+        acc += v;
+      });
+      if (r.s.income > 0) {
+        const iy = y(r.s.income);
+        marks += `<line x1="${(x - 4).toFixed(1)}" x2="${(x + bw + 4).toFixed(1)}" y1="${iy.toFixed(1)}" y2="${iy.toFixed(1)}"
+          style="stroke:var(--pos)" stroke-width="2" stroke-dasharray="5 3"/>`;
+      }
+      const last = i === rows.length - 1;
+      labels += `<text x="${cx.toFixed(1)}" y="${H-11}" text-anchor="middle" font-size="10.5"
+        style="fill:var(--${last?'ink-2':'ink-3'})" font-weight="${last?600:400}">${MON3[Number(r.k.split('-')[1])-1]}</text>`;
+      if (last && r.s.spend > 0) labels += `<text x="${cx.toFixed(1)}" y="${(y(r.s.spend)-7).toFixed(1)}" text-anchor="middle"
+        font-size="10" font-weight="600" style="fill:var(--ink-2)">${fmt(r.s.spend)}</text>`;
+      hit += `<rect x="${(L+gw*i).toFixed(1)}" y="${T}" width="${gw.toFixed(1)}" height="${ph}" fill="transparent" data-mi="${i}"/>`;
+    });
+    return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" style="display:block;max-width:100%"
+      aria-label="Spending by category each month, with a mark for income">${grid}${bars}${marks}${labels}<g class="hits">${hit}</g></svg>`;
+  }
+
+  const legend = `<div class="legend">
+    ${series.map((c, k) => `<span class="lg"><i style="background:${catColour(c, k)}"></i>${esc(catLabel(c, tail))}</span>`).join('')}
+    <span class="lg"><i style="background:var(--pos);height:3px;border-radius:0"></i>Income</span></div>`;
+
+  return { legend, mount(box) {
+    box.innerHTML = build(Math.max(280, Math.round(box.clientWidth || 640)));
+    $$('.hits rect', box).forEach(el => {
+      el.addEventListener('mousemove', ev => {
+        const r = rows[+el.dataset.mi];
+        const lines = series.map((c, k) => ({ c, k, v: catValue(r, c, tail) }))
+          .filter(x => x.v > 0.004).sort((a, b) => b.v - a.v)
+          .map(x => `<div class="t-r"><span><i style="background:${catColour(x.c, x.k)}"></i>${esc(catLabel(x.c, tail))}</span><b>${fmt(x.v)}</b></div>`)
+          .join('');
+        showTip(`<div class="t-h">${monthLabel(r.k)}</div>${lines}
+          <div class="t-r" style="margin-top:5px;padding-top:5px;border-top:1px solid var(--line)"><span>Spent</span><b>${fmt(r.s.spend)}</b></div>
+          <div class="t-r"><span><i style="background:var(--pos)"></i>Income</span><b>${fmt(r.s.income)}</b></div>
+          <div class="t-r"><span>Net</span><b style="color:var(--${r.s.net>=0?'pos':'neg'})">${fmtSigned(r.s.net)}</b></div>`, ev);
+      });
+      el.addEventListener('mouseleave', hideTip);
+    });
+  }};
+}
+
+/** Weekly variable spend, last 12 weeks, single series. */
+function chartWeeks(weeks) {
+  const max = niceMax(Math.max(1, ...weeks.map(w => w.v)));
+
+  function build(W) {
+    const H = 150, L = 46, R = 14, T = 16, B = 26;
+    const pw = W - L - R, ph = H - T - B;
+    const gw = pw / weeks.length, bw = Math.max(5, Math.min(26, gw * 0.62));
+    const y = v => T + ph - (v / max) * ph;
+    let grid = '';
+    for (const tv of [0, max/2, max]) {
+      grid += `<line x1="${L}" x2="${W-R}" y1="${y(tv).toFixed(1)}" y2="${y(tv).toFixed(1)}" style="stroke:var(--line)" stroke-width="1"/>`;
+      grid += `<text x="${L-9}" y="${(y(tv)+3.5).toFixed(1)}" text-anchor="end" font-size="10" style="fill:var(--ink-3)">${fmt(tv)}</text>`;
+    }
+    let bars = '', labels = '', hit = '';
+    weeks.forEach((w, i) => {
+      const cx = L + gw*i + gw/2, x = cx - bw/2;
+      const h = w.v > 0 ? Math.max(2, (w.v/max)*ph) : 0;
+      const last = i === weeks.length - 1;
+      if (h) bars += `<path d="${barPath(x, T+ph-h, bw, h, 4)}" style="fill:var(--accent);opacity:${last ? 1 : 0.42}"/>`;
+      if (last && h) labels += `<text x="${cx.toFixed(1)}" y="${(T+ph-h-6).toFixed(1)}" text-anchor="middle" font-size="10" font-weight="600" style="fill:var(--accent)">${fmt(w.v)}</text>`;
+      if (i % 2 === 0 || last) labels += `<text x="${cx.toFixed(1)}" y="${H-9}" text-anchor="middle" font-size="9.5" style="fill:var(--ink-3)">${w.ws.getDate()}/${w.ws.getMonth()+1}</text>`;
+      hit += `<rect x="${(L+gw*i).toFixed(1)}" y="${T}" width="${gw.toFixed(1)}" height="${ph}" fill="transparent" data-wi="${i}"/>`;
+    });
+    return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" style="display:block;max-width:100%"
+      aria-label="Variable spending by week, last ${weeks.length} weeks">${grid}${bars}${labels}<g class="hits">${hit}</g></svg>`;
+  }
+
+  return { mount(box) {
+    box.innerHTML = build(Math.max(280, Math.round(box.clientWidth || 640)));
+    $$('.hits rect', box).forEach(el => {
+      el.addEventListener('mousemove', ev => {
+        const w = weeks[+el.dataset.wi];
+        showTip(`<div class="t-h">Week of ${weekLabel(w.ws)}</div>
+          <div class="t-r"><span><i style="background:var(--accent)"></i>Variable</span><b>${fmt(w.v, true)}</b></div>`, ev);
+      });
+      el.addEventListener('mouseleave', hideTip);
+    });
+  }};
+}
+
+/* charts are sized to their container, so they re-mount on resize */
+let MOUNTED = [];
+function mountChart(chart, box) { if (!box) return; MOUNTED.push([chart, box]); chart.mount(box); }
+let rzT;
+addEventListener('resize', () => {
+  clearTimeout(rzT);
+  rzT = setTimeout(() => MOUNTED.forEach(([c, b]) => b.isConnected && c.mount(b)), 140);
+});
+
+/* ============================ view pieces ============================ */
+function deltaBits(cur, prev) {
+  const d = cur - prev;
+  const ratio = Math.abs(prev) > 0.5 ? Math.abs(d) / Math.abs(prev) : null;
+  const pct = ratio !== null && ratio <= 3 ? ` · ${Math.round(ratio * 100)}%` : '';
+  return { d, txt: `${d > 0 ? '▲' : '▼'} ${fmt(Math.abs(d))}${pct}` };
+}
+/** Pill — reserved for the single headline figure. `neutral` for an
+ *  unfinished month, where a part-month vs whole-month gap means nothing yet. */
+function deltaChip(cur, prev, lowerIsBetter, word = 'vs last month', neutral = false) {
+  const { d, txt } = deltaBits(cur, prev);
+  if (Math.abs(d) < 0.5) return `<span class="delta flat">Level ${word}</span>`;
+  if (neutral) return `<span class="delta flat">${txt} ${word}</span>`;
+  const good = lowerIsBetter ? d < 0 : d > 0;
+  return `<span class="delta ${good ? 'good' : 'bad'}">${txt} ${word === 'vs last month' ? '' : word}</span>`;
+}
+/** Quiet inline version for supporting figures. */
+function deltaLine(cur, prev, lowerIsBetter, word = 'vs last month', neutral = false) {
+  const { d, txt } = deltaBits(cur, prev);
+  if (Math.abs(d) < 0.5) return `<span class="dl">Level ${word}</span>`;
+  const good = lowerIsBetter ? d < 0 : d > 0;
+  const col = neutral ? 'var(--ink-3)' : `var(--${good ? 'pos' : 'neg'})`;
+  return `<span class="dl"><b style="color:${col}">${txt}</b> ${word}</span>`;
+}
+
+
+function healthPanel() {
+  const h = healthState();
+  const applied = h.cur ? h.cur.applied : 0;
+  const raw = h.cur ? h.cur.delta : 0;
+  const pips = 15, on = Math.round(h.pct * pips);
+  const col = `var(--${h.tier.col})`;
+  const hpn = (v) => Math.round(v).toLocaleString('en-US');
+
+  const cap = h.cur ? reserveState().rows.find(r => r.mk === h.cur.mk).capacity : h.c.baselineIncome;
+  const note = h.hp >= h.max
+    ? `Full health, and it cannot go higher. Stay under the ${fmt(cap)} your income covers and you hold it.`
+    : raw < 0
+      ? `${monthLabel(h.cur.mk)} is costing you a point per euro spent past what your income covers.`
+      : `Healing at a point per euro you come in under. ${hpn(h.max - h.hp)} to go before you are back to full.`;
+
+  return `<section class="panel" style="color:${col}">
+    <div class="hpwrap">
+      <div class="hpmain">
+        <span class="eyebrow" style="color:var(--ink-3)">Health · <span class="tiername" style="color:${col}">${h.tier.name}</span></span>
+        <div class="hpfig"><span>${hpn(h.hp)}</span><span>/ ${hpn(h.max)} HP</span></div>
+        <div class="pips" role="img" aria-label="${hpn(h.hp)} of ${hpn(h.max)} health points">
+          ${Array.from({length: pips}, (_, i) => `<i class="${i < on ? 'on' : ''}"></i>`).join('')}
+        </div>
+        <p class="hero-note" style="color:var(--ink-2)">${note}</p>
+      </div>
+      <div class="hpdelta">
+        <span class="eyebrow" style="color:var(--ink-3)">${h.cur ? monthLabel(h.cur.mk, true) + ' so far' : 'This month'}</span>
+        <b style="color:var(--${applied > 0.5 ? 'pos' : applied < -0.5 ? 'neg' : 'ink-3'})">${applied > 0.5 ? '+' : ''}${hpn(applied)} HP</b>
+        <span class="dl">${applied < -0.5 ? 'lost to overspending'
+          : applied > 0.5 ? 'healed back'
+          : h.hp >= h.max ? 'still at full health' : 'no change yet'}</span>
+      </div>
+    </div>
+  </section>`;
+}
+
+function reservePanel() {
+  const r = reserveState(), cur = r.current;
+  const scale = Math.max(1, r.c.reserveStart, r.drawn);
+  const width = value => Math.max(0, value / scale * 100).toFixed(2);
+  return `<section class="panel">
+    <div class="panel-hd"><h2>Reserve · where the money went</h2><span class="sub">Since ${monthLabel(r.c.reserveAsOf, true)} · starting reserve ${fmt(r.c.reserveStart)}</span></div>
+    <div style="padding:16px 18px">
+      <div class="meter" style="gap:0" role="img" aria-label="Overall loss ${fmt(r.drawn)}: extraordinary expenses ${fmt(r.extraordinaryDrawn)}, monthly overspending ${fmt(r.ordinaryDrawn)}. Reserve left ${fmt(r.remaining)}.">
+        <i class="ship" style="width:${width(r.extraordinaryDrawn)}%;flex-shrink:0"></i>
+        <i class="other" style="width:${width(r.ordinaryDrawn)}%;flex-shrink:0"></i><i class="left"></i>
+      </div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px">
+        <span class="lg"><i style="background:var(--pos);opacity:.35"></i>Reserve remaining</span>
+        <span class="lg"><i style="background:var(--accent);opacity:.45"></i>Extraordinary expenses</span>
+        <span class="lg"><i style="background:var(--neg)"></i>Monthly overspending</span>
+      </div>
+    </div>
+    <div class="resgrid">
+      <div class="rescell"><span class="eyebrow">Reserve remaining</span><b>${fmt(r.remaining)}</b><span class="dl">${r.remaining<0?'Reserve exhausted · shortfall shown above':'After all reserve losses'}</span></div>
+      <div class="rescell"><span class="eyebrow">Overall loss</span><b>${fmt(r.drawn)}</b><span class="dl">Extraordinary loss + monthly overspending</span></div>
+      <div class="rescell"><span class="eyebrow">Extraordinary loss</span><b style="color:var(--accent)">${fmt(r.extraordinaryDrawn)}</b><span class="dl">One-off costs funded by the reserve</span></div>
+      <div class="rescell"><span class="eyebrow">Monthly overspending</span><b style="color:var(--neg)">${fmt(r.ordinaryDrawn)}</b><span class="dl">Ordinary spending above monthly income allowance</span></div>
+    </div>
+    <div style="padding:16px 18px">
+      <p><b>This month:</b> ${fmt(cur?.draw||0)} total reserve loss = ${fmt(cur?.extraordinaryDraw||0)} extraordinary + ${fmt(cur?.ordinaryDraw||0)} monthly overspending.</p>
+      <p class="hint">Ordinary expenses use the monthly income allowance first. Extraordinary expenses use any income left over; only the remainder reduces the reserve. The allowance is the higher of your configured baseline and the month’s recorded income. As before, monthly surpluses do not replenish this tracked reserve. The current month is provisional.</p>
+      <details><summary>Monthly loss breakdown</summary><div class="scroller"><table class="cmptbl"><thead><tr><th>Month</th><th>Income allowance</th><th>Ordinary spending</th><th>Extraordinary spending</th><th>Extraordinary loss</th><th>Overspending loss</th><th>Total loss</th></tr></thead><tbody>${r.rows.map(row=>`<tr><td>${monthLabel(row.mk,true)}</td><td>${fmt(row.capacity)}</td><td>${fmt(row.st.ordinarySpend)}</td><td>${fmt(row.st.extraordinary)}</td><td>${fmt(row.extraordinaryDraw)}</td><td>${fmt(row.ordinaryDraw)}</td><td>${fmt(row.draw)}</td></tr>`).join('')}</tbody></table></div></details>
+    </div>
+  </section>`;
+}
+
+function categoryPanel(s, rank) {
+  const rows = Object.entries(s.byCat)
+    .map(([c, v]) => ({ c, ...v, total: v.variable + v.fixed }))
+    .filter(r => r.total > 0.004)
+    .sort((a, b) => b.total - a.total);
+  if (!rows.length) return '';
+  const max = rows[0].total;
+  const hueOf = (c) => { const i = rank ? rank.top.indexOf(c) : -1; return i >= 0 ? `var(--k${i})` : 'var(--kx)'; };
+  return `<section class="panel">
+    <div class="panel-hd"><h2>Ordinary spending by category</h2><span class="sub">${rows.length} categories · one-off costs have their own tab</span></div>
+    <div class="catlist" style="padding:8px 0">
+      ${rows.map(r => `<button class="catrow" data-catopen="${r.c}" title="Break ${esc(CATNAME[r.c] || r.c)} down">
+        <span class="nm">${esc(CATNAME[r.c] || r.c)}</span>
+        <span class="track">
+          ${r.variable > 0.004 ? `<i class="fill" style="width:${(r.variable/max*100).toFixed(2)}%;background:${hueOf(r.c)}"></i>` : ''}
+          ${r.fixed > 0.004 ? `<i class="fill fixed" style="width:${(r.fixed/max*100).toFixed(2)}%;background:${hueOf(r.c)}"></i>` : ''}
+        </span>
+        <span class="vl">${fmt(r.total)}</span>
+      </button>`).join('')}
+    </div>
+    <div class="panel-hd" style="border-bottom:none;border-top:1px solid var(--line)">
+      <span class="lg"><i style="background:var(--accent)"></i>Logged spending</span>
+      <span class="lg"><i style="background:var(--accent);opacity:.42"></i>Fixed commitments</span>
+    </div>
+  </section>`;
+}
+
+function txList(list, opts = {}) {
+  if (!list.length) return '';
+  const byDay = {};
+  for (const t of list) (byDay[t.d] = byDay[t.d] || []).push(t);
+  const days = Object.keys(byDay).sort().reverse();
+  return days.map(d => {
+    const items = byDay[d];
+    const dayTotal = items.reduce((a, t) => a + (t.t === 'inc' ? 0 : Number(t.a) || 0), 0);
+    const dt = parseISO(d);
+    const isToday = d === iso(TODAY);
+    return `<div class="daygrp">
+      <div class="dayhd"><span>${isToday ? 'Today · ' : ''}${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][dt.getDay()]} ${dt.getDate()} ${MON3[dt.getMonth()]}</span>
+        <b>${dayTotal > 0.004 ? fmt(dayTotal, true) : '—'}</b></div>
+      ${items.map(t => `<button class="txrow" data-edit="${t.id}" data-mk="${t.mk || opts.mk}">
+        <span class="mn"><b>${esc(t.n || CATNAME[t.c] || 'Entry')}</b><span>${esc(CATNAME[t.c] || t.c)}${
+          t.t === 'extra' ? ' · <span class="chip">Extraordinary</span>' : ''}${
+          t.docs && t.docs.length ? ` · <span class="clip">${ICON_CLIP}${t.docs.length}</span>` : ''}</span></span>
+        <span class="amt ${t.t === 'inc' ? 'inc' : ''}">${t.t === 'inc' ? '+' : ''}${fmt(Number(t.a) || 0, true)}</span>
+        <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--ink-3);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 5l7 7-7 7"/></svg>
+      </button>`).join('')}
+    </div>`;
+  }).join('');
+}
+
+/**
+ * What a single category is actually made of, for one month.
+ *
+ * Entries carrying the same note are one line — three trips to the same
+ * restaurant read as one restaurant — and the subscriptions or housing charges
+ * that belong to the category join them as their own lines. Slices are shaded
+ * by size on a single hue rather than given identities of their own, so the
+ * ring says how big, and the list says what.
+ */
+function categoryParts(mk, cat) {
+  const bag = new Map();
+  const add = (key, label, amount, fixed) => {
+    const k = key.toLowerCase();
+    const cur = bag.get(k) || { label, amount: 0, count: 0, fixed };
+    cur.amount += amount; cur.count += 1;
+    bag.set(k, cur);
+  };
+  for (const t of txOf(mk)) {
+    if (t.t !== 'exp' || t.c !== cat) continue;
+    const note = (t.n || '').trim();
+    add(note || '\u0000unlabelled', note || 'Unlabelled', Number(t.a) || 0, false);
+  }
+  for (const it of state.recurring) {
+    if (it.kind === 'income' || it.category !== cat || !activeIn(it, mk)) continue;
+    add('\u0001' + it.name, it.name, monthlyEq(it, mk), true);
+  }
+  const parts = [...bag.values()].sort((a, b) => b.amount - a.amount);
+  const total = parts.reduce((a, x) => a + x.amount, 0);
+  if (parts.length > 8) {
+    const tail = parts.splice(7);
+    parts.push({ label: `${tail.length} smaller items`, amount: tail.reduce((a, x) => a + x.amount, 0),
+                 count: tail.reduce((a, x) => a + x.count, 0), fixed: false, tail: true });
+  }
+  return { parts, total };
+}
+function donut(parts, total) {
+  const S = 190, R = 78, r = 47, C = S / 2;
+  if (total <= 0) return '';
+  const pt = (ang, rad) => [C + rad * Math.cos(ang - Math.PI / 2), C + rad * Math.sin(ang - Math.PI / 2)];
+  let a0 = 0, out = '';
+  parts.forEach((p, i) => {
+    const frac = p.amount / total;
+    let a1 = a0 + frac * Math.PI * 2;
+    const gap = parts.length > 1 ? Math.min(0.02, frac * Math.PI) : 0;
+    const s = a0 + gap / 2, e = Math.max(s + 0.001, a1 - gap / 2);
+    const big = (e - s) > Math.PI ? 1 : 0;
+    const [x1, y1] = pt(s, R), [x2, y2] = pt(e, R), [x3, y3] = pt(e, r), [x4, y4] = pt(s, r);
+    out += `<path d="M${x1.toFixed(2)} ${y1.toFixed(2)} A${R} ${R} 0 ${big} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}
+      L${x3.toFixed(2)} ${y3.toFixed(2)} A${r} ${r} 0 ${big} 0 ${x4.toFixed(2)} ${y4.toFixed(2)} Z"
+      style="fill:var(--r${Math.min(i, 6)})"><title>${esc(p.label)} — ${fmt(p.amount, true)}</title></path>`;
+    a0 = a1;
+  });
+  return `<svg class="donut" viewBox="0 0 ${S} ${S}" width="${S}" height="${S}" role="img"
+    aria-label="Breakdown by item, largest first">${out}
+    <text x="${C}" y="${C - 4}" text-anchor="middle" font-size="21" font-weight="600"
+      style="fill:var(--ink);font-family:var(--mono)" letter-spacing="-1">${fmt(total)}</text>
+    <text x="${C}" y="${C + 14}" text-anchor="middle" font-size="9.5"
+      style="fill:var(--ink-3);font-family:var(--mono);letter-spacing:.09em">IN THE MONTH</text></svg>`;
+}
+function sheetCategory(mk, cat) {
+  const build = () => {
+    const { parts, total } = categoryParts(mk, cat);
+    return { html: `
+      <div class="sheet-hd"><h2>${esc(CATNAME[cat] || cat)}</h2>${closeIcon}</div>
+      <div class="sheet-bd">
+        <span class="eyebrow">${monthLabel(mk)}</span>
+        ${total > 0 ? donut(parts, total) : '<p class="hint" style="text-align:center;padding:26px 0">Nothing in this category this month.</p>'}
+        ${total > 0 ? `<div>${parts.map((p, i) => `<div class="slicerow">
+            <i style="background:var(--r${Math.min(i, 6)})"></i>
+            <span class="nm2">${esc(p.label)}${p.count > 1 || p.fixed ? `<span>${[
+              p.count > 1 ? `${p.count} entries added together` : '',
+              p.fixed ? 'a fixed commitment' : '',
+            ].filter(Boolean).join(' · ')}</span>` : ''}</span>
+            <span class="amt2">${fmt(p.amount, true)}</span>
+            <span class="pct">${Math.round(p.amount / total * 100)}%</span>
+          </div>`).join('')}</div>` : ''}
+        ${total > 0 ? `<p class="hint">Entries sharing a note are counted as one line. Rename an entry and it will join or leave a group.</p>` : ''}
+      </div>` };
+  };
+  openSheet(build().html, null);
+}
+
+/* ============================ views ============================ */
+/** What comes in every month, without being typed again: the salary from the
+ *  settings, plus any standing income of its own. */
+function incomePanel(mk, s) {
+  const items = subsOf('income');
+  const act = items.filter(i => activeIn(i, mk));
+  const rows = act.map(i => `<tr>
+      <td><b style="font-weight:500">${esc(i.name)}</b></td>
+      <td><span class="chip">${esc(CATNAME[i.category] || i.category)}</span></td>
+      <td class="r num" style="font-weight:500;color:var(--pos)">${fmt(monthlyEq(i, mk), true)}</td>
+      <td class="r"><button class="iconbtn" data-rec="${i.id}" aria-label="Edit ${esc(i.name)}"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 00-4-4L4 16z"/></svg></button></td>
+    </tr>`).join('');
+  const logged = txOf(mk).filter(t => t.t === 'inc').reduce((a, t) => a + (Number(t.a) || 0), 0);
+  return `<section class="panel">
+    <div class="panel-hd"><h2>Income each month</h2>
+      <button class="addbtn" data-open="income" style="margin-left:auto;display:flex"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add income</button></div>
+    <div class="scroller"><table class="tbl"><tbody>
+      <tr><td><b style="font-weight:500">Salary</b></td><td><span class="chip">Salary</span></td>
+        <td class="r num" style="font-weight:500;color:var(--pos)">${fmt(s.salary)}</td>
+        <td class="r"><button class="iconbtn" data-open="settings" aria-label="Change the salary"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 00-4-4L4 16z"/></svg></button></td></tr>
+      ${rows}
+      ${logged > 0 ? `<tr><td><b style="font-weight:500">One-off entries</b></td><td><span class="chip">logged</span></td>
+        <td class="r num" style="font-weight:500;color:var(--pos)">${fmt(logged)}</td><td></td></tr>` : ''}
+      <tr style="border-top:2px solid var(--rule)"><td><b>Total</b></td><td></td>
+        <td class="r num" style="font-weight:700;color:var(--pos)">${fmt(s.income)}</td><td></td></tr>
+    </tbody></table></div>
+    <div class="banner" style="margin:0;border-radius:0 0 var(--r) var(--r)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+      <span>Standing income is added to every month on its own — don't log it in the Ledger as well, or it counts twice.</span></div>
+  </section>`;
+}
+
+function viewOverview() {
+  const mk = state.cursor, pmk = addMonths(mk, -1);
+  const s = monthStats(mk), p = monthStats(pmk);
+  const partial = mk === THIS_MONTH;
+  const word = partial ? `so far, against all of ${monthLabel(pmk, true)}` : `vs ${monthLabel(pmk, true)}`;
+  const keys = recentMonths(6, mk);
+  const ch = chartMonths(keys);
+  const recent = [...txOf(mk)].sort((a, b) => (b.d.localeCompare(a.d)) || 0).slice(0, 6);
+  const netCls = s.net >= 0 ? 'pos' : 'neg';
+  const note = (s.income > 0
+    ? `You kept ${Math.round(Math.max(0, s.net) / s.income * 100)}% of what came in. Fixed commitments alone run ${fmt(s.fixed)} a month.`
+    : `No income recorded for ${monthLabel(mk)} yet. Fixed commitments run ${fmt(s.fixed)} a month.`)
+    + (partial ? ` ${MONTHS[Number(mk.split('-')[1]) - 1]} is still running — the weekly report compares like for like.` : '');
+
+  return { html: `
+    <section class="hero">
+      <div class="hero-net">
+        <span class="eyebrow">Net · ${monthLabel(mk)}</span>
+        <span class="hero-fig ${netCls}">${fmtSigned(s.net)}</span>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">${deltaChip(s.net, p.net, false, word, partial)}</div>
+        <p class="hero-note">${note}</p>
+      </div>
+      <div class="hero-split">
+        <div class="hsplit"><span class="eyebrow">Income</span><b style="color:var(--pos)">${fmt(s.income)}</b>${deltaLine(s.income, p.income, false, word, partial)}</div>
+        <div class="hsplit"><span class="eyebrow">Spending</span><b style="color:var(--neg)">${fmt(s.spend)}</b>${deltaLine(s.spend, p.spend, true, word, partial)}</div>
+      </div>
+    </section>
+
+    ${mk === THIS_MONTH ? healthPanel() + reservePanel() : ''}
+
+    ${incomePanel(mk, s)}
+
+    <div class="tiles">
+      <div class="tile"><span class="eyebrow">Logged spending</span><b>${fmt(s.variable + s.extraordinary)}</b><span class="cap">${fmt(s.extraordinary)} extraordinary · ${s.count} entries</span></div>
+      <div class="tile"><span class="eyebrow">Subscriptions</span><b>${fmt(s.subs)}</b><span class="cap">${subsOf('sub').filter(i => activeIn(i, mk)).length} active · auto-counted</span></div>
+      <div class="tile"><span class="eyebrow">Housing</span><b>${fmt(s.housing)}</b><span class="cap">${s.housing > 0 ? 'rent, heating & utilities' : 'nothing set up yet'}</span></div>
+      <div class="tile"><span class="eyebrow">Fixed total</span><b>${fmt(s.fixed)}</b><span class="cap">${s.spend > 0 ? Math.round(s.fixed / s.spend * 100) + '% of all spending' : '—'}</span></div>
+    </div>
+
+    <section class="panel">
+      <div class="panel-hd"><h2>Six months by ordinary category</h2><span class="sub">${monthLabel(keys[0], true)} – ${monthLabel(keys[5], true)} · extraordinary expenses have their own tab</span></div>
+      <div class="chartbox"><div id="ch-months"></div>${ch.legend}</div>
+    </section>
+
+    ${categoryPanel(s, catRanking(keys.map(k => ({ k, s: monthStats(k) }))))}
+
+    <section class="panel">
+      <div class="panel-hd"><h2>Latest entries</h2>${recent.length ? `<button class="linkish sub" data-nav="ledger" style="margin-left:auto">See all ${s.count}</button>` : ''}</div>
+      ${recent.length ? txList(recent, { mk }) : `<div class="empty">
+        <h3>Nothing logged for ${monthLabel(mk)}</h3>
+        <p>Subscriptions and housing are counted automatically. Add the variable things here — groceries, books, a train ticket.</p>
+        <button class="btn pri" data-open="add" style="flex:none">Add your first entry</button></div>`}
+    </section>`,
+    wire(root) { mountChart(ch, $('#ch-months', root)); } };
+}
+
+function viewLedger() {
+  const mk = state.cursor, s = monthStats(mk);
+  const standing = subsOf('income').filter(i => activeIn(i, mk));
+  const list = [...txOf(mk)].sort((a, b) => b.d.localeCompare(a.d));
+  return { html: `
+    <div class="tiles" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      <div class="tile"><span class="eyebrow">Logged spending</span><b style="color:var(--neg)">${fmt(s.variable + s.extraordinary)}</b><span class="cap">${fmt(s.extraordinary)} extraordinary · ${list.filter(t => t.t !== 'inc').length} entries</span></div>
+      <div class="tile"><span class="eyebrow">Income</span><b style="color:var(--pos)">${fmt(s.income)}</b><span class="cap">${s.salary > 0 ? fmt(s.salary) + ' salary' : 'no salary set'}${s.recurringIncome > 0.004 ? ' + ' + fmt(s.recurringIncome) + ' standing' : ''}${s.extraIncome - s.recurringIncome > 0.004 ? ' + ' + fmt(s.extraIncome - s.recurringIncome) + ' extra' : ''}</span></div>
+      <div class="tile"><span class="eyebrow">Running net</span><b>${fmtSigned(s.income - s.variable - s.extraordinary)}</b><span class="cap">before ${fmt(s.fixed)} fixed</span></div>
+    </div>
+    <section class="panel">
+      <div class="panel-hd"><h2>${monthLabel(mk)}</h2><button class="addbtn" data-open="add" style="margin-left:auto;display:flex"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add entry</button></div>
+      ${s.salary > 0 || standing.length ? `<div class="daygrp">
+        <div class="dayhd"><span>Automatic · 1 ${MON3[Number(mk.split('-')[1]) - 1]}</span><b>posted every month</b></div>
+        ${s.salary > 0 ? `<button class="txrow" data-open="settings">
+          <span class="mn"><b>Salary</b><span>Counted automatically — don't log it again</span></span>
+          <span class="amt inc">+${fmt(s.salary, true)}</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--ink-3);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 5l7 7-7 7"/></svg>
+        </button>` : ''}
+        ${standing.map(i => `<button class="txrow" data-rec="${i.id}">
+          <span class="mn"><b>${esc(i.name)}</b><span>${esc(CATNAME[i.category] || i.category)} · counted automatically — don't log it again</span></span>
+          <span class="amt inc">+${fmt(monthlyEq(i, mk), true)}</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--ink-3);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 5l7 7-7 7"/></svg>
+        </button>`).join('')}</div>` : ''}
+      ${list.length ? txList(list, { mk }) : (s.salary > 0 || standing.length) ? '' : `<div class="empty">
+        <h3>No entries for ${monthLabel(mk)}</h3>
+        <p>Log what varies month to month. Recurring subscriptions, rent and heating live on their own tabs so you never type them twice.</p>
+        <button class="btn pri" data-open="add" style="flex:none">Add entry</button></div>`}
+    </section>` };
+}
+
+function viewExtra() {
+  const mk = state.cursor, s = monthStats(mk);
+  const list = txOf(mk).filter(t => t.t === 'extra').sort((a, b) => b.d.localeCompare(a.d));
+  const year = mk.slice(0, 4);
+  const yearTotal = Object.keys(state.months).filter(k => k.startsWith(year + '-'))
+    .reduce((sum, k) => sum + monthStats(k).extraordinary, 0);
+  const categories = new Map();
+  for (const t of list) categories.set(t.c, (categories.get(t.c) || 0) + (Number(t.a) || 0));
+  return { html: `
+    <section class="panel" style="padding:22px 24px">
+      <span class="eyebrow">OUTSIDE THE ORDINARY BUDGET</span>
+      <h2 style="margin:8px 0">Extraordinary expenses</h2>
+      <p class="hero-note">Log one-off costs here. They count in your real spending, net balance and reserve. They do not cost Health Points or set the pace for ordinary spending forecasts.</p>
+      <button class="btn pri" data-open="extra" style="margin-top:16px">Add extraordinary expense</button>
+    </section>
+    <div class="tiles" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      <div class="tile"><span class="eyebrow">${monthLabel(mk)}</span><b style="color:var(--neg)">${fmt(s.extraordinary, true)}</b><span class="cap">${list.length} one-off ${list.length === 1 ? 'expense' : 'expenses'}</span></div>
+      <div class="tile"><span class="eyebrow">${year} total</span><b>${fmt(yearTotal, true)}</b><span class="cap">extraordinary expenses logged</span></div>
+      <div class="tile"><span class="eyebrow">Actual month out</span><b>${fmt(s.spend, true)}</b><span class="cap">ordinary, fixed and extraordinary</span></div>
+    </div>
+    <section class="panel">
+      <div class="panel-hd"><h2>${monthLabel(mk)} · one-off costs</h2></div>
+      ${categories.size ? `<div class="catlist" style="padding:8px 0">${[...categories].sort((a,b) => b[1]-a[1]).map(([cat, amount]) => `<div class="catrow"><span class="nm">${esc(CATNAME[cat] || cat)}</span><span class="track"><i class="fill" style="width:${s.extraordinary ? (amount/s.extraordinary*100).toFixed(2) : 0}%"></i></span><span class="vl">${fmt(amount, true)}</span></div>`).join('')}</div>` : ''}
+      ${list.length ? txList(list, { mk }) : `<div class="empty"><h3>No extraordinary expenses for ${monthLabel(mk)}</h3><p>Record unusual costs here without changing your Health Points objective.</p><button class="btn pri" data-open="extra">Add a one-off expense</button></div>`}
+    </section>` };
+}
+
+function recurringTable(kind, mk) {
+  const items = subsOf(kind)
+    .map(i => ({ ...i, m: monthlyEq(i, mk), on: activeIn(i, mk) }))
+    .sort((a, b) => (b.on - a.on) || (b.m - a.m));
+  if (!items.length) return null;
+  return `<div class="scroller"><table class="tbl">
+    <thead><tr>
+      <th>${kind === 'sub' ? 'Service' : kind === 'income' ? 'Source' : 'Item'}</th><th>Category</th><th class="r">Billed</th>
+      <th class="r">Per month</th><th class="r">Per year</th><th>${kind === 'income' ? 'Receiving since' : 'Paying since'}</th><th></th>
+    </tr></thead><tbody>
+    ${items.map(i => {
+      const months = i.since ? Math.max(0, monthsBetween(i.since, i.status === 'active' ? THIS_MONTH : (i.ended || THIS_MONTH))) : null;
+      return `<tr style="${i.on ? '' : 'opacity:.5'}">
+        <td><b style="font-weight:500">${esc(i.name)}</b>${i.on ? '' : ' <span class="chip off">ended</span>'}${
+          i.docs && i.docs.length ? ` <span class="clip">${ICON_CLIP}${i.docs.length}</span>` : ''}</td>
+        <td><span class="chip ${isWork(i) ? 'work' : ''}">${esc(CATNAME[i.category] || i.category)}</span></td>
+        <td class="r num" style="color:var(--ink-3)">${hasSchedule(i)
+          ? `<span class="chip">varies</span>`
+          : `${fmt(i.amount, i.amount % 1 !== 0)}<span style="font-size:11px"> /${i.basis === 'yearly' ? 'yr' : 'mo'}</span>`}</td>
+        <td class="r num" style="font-weight:500">${fmt(i.m, true)}</td>
+        <td class="r num" style="color:var(--ink-3)">${fmt(yearlyEq(i, mk))}</td>
+        <td>${i.since
+          ? `<span class="num" style="font-size:12px">${monthLabel(i.since, true)}</span> <span style="color:var(--ink-3);font-size:11.5px">· ${humanDuration(months)}${
+              hasSchedule(i) ? ` · ${schedMonths(i).length} months scheduled` : ` · ≈${fmt(i.m * months)} ${kind === 'income' ? 'received' : 'paid'}`}</span>`
+          : `<button class="linkish" data-rec="${i.id}">Set start date</button>`}</td>
+        <td class="r"><button class="iconbtn" data-rec="${i.id}" aria-label="Edit ${esc(i.name)}"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 00-4-4L4 16z"/></svg></button></td>
+      </tr>`; }).join('')}
+    </tbody></table></div>`;
+}
+
+function viewSubs() {
+  const mk = state.cursor;
+  const act = subsOf('sub').filter(i => activeIn(i, mk));
+  const total = act.reduce((a, i) => a + monthlyEq(i, mk), 0);
+  const work = act.filter(isWork).reduce((a, i) => a + monthlyEq(i, mk), 0);
+  const s = monthStats(mk);
+  const tbl = recurringTable('sub', mk);
+  return { html: `
+    <div class="tiles">
+      <div class="tile"><span class="eyebrow">Per month</span><b>${fmt(total, true)}</b><span class="cap">${act.length} active in ${monthLabel(mk, true)}</span></div>
+      <div class="tile"><span class="eyebrow">Per year</span><b>${fmt(total * 12)}</b><span class="cap">yearly plans spread evenly</span></div>
+      <div class="tile"><span class="eyebrow">Work &amp; research</span><b style="color:var(--accent)">${fmt(work, true)}</b><span class="cap">${total > 0 ? Math.round(work / total * 100) : 0}% — deductible candidates</span></div>
+      <div class="tile"><span class="eyebrow">Personal</span><b>${fmt(total - work, true)}</b><span class="cap">${s.income > 0 ? Math.round((total - work) / s.income * 100) + '% of income' : 'entertainment, press, health'}</span></div>
+    </div>
+    <section class="panel">
+      <div class="panel-hd"><h2>Subscriptions</h2><button class="addbtn" data-open="sub" style="margin-left:auto;display:flex"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add subscription</button></div>
+      ${tbl || `<div class="empty"><h3>No subscriptions yet</h3>
+        <p>Add each service with its real billing cycle. Yearly plans are converted to a monthly figure automatically.</p>
+        <button class="btn pri" data-open="sub" style="flex:none">Add subscription</button></div>`}
+    </section>
+    <div class="banner"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+      <span>These charges are added to every month automatically — don't log them again in the Ledger, or they'll count twice.</span></div>` };
+}
+
+function viewHousing() {
+  const mk = state.cursor, s = monthStats(mk);
+  const fixedItems = subsOf('housing').filter(i => activeIn(i, mk));
+  const fixedTotal = fixedItems.reduce((a, i) => a + monthlyEq(i, mk), 0);
+  const logged = txOf(mk).filter(t => t.t !== 'inc' && t.c === 'housing');
+  const loggedTotal = logged.reduce((a, t) => a + (Number(t.a) || 0), 0);
+  const all = fixedTotal + loggedTotal;
+  const tbl = recurringTable('housing', mk);
+  return { html: `
+    <div class="tiles" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+      <div class="tile"><span class="eyebrow">Housing this month</span><b>${fmt(all, true)}</b><span class="cap">${fmt(fixedTotal)} fixed + ${fmt(loggedTotal)} billed</span></div>
+      <div class="tile"><span class="eyebrow">Share of income</span><b>${s.income > 0 ? Math.round(all / s.income * 100) + '%' : '—'}</b><span class="cap">${s.income > 0 ? 'of ' + fmt(s.income) + ' in' : 'record income to see this'}</span></div>
+      <div class="tile"><span class="eyebrow">Per year</span><b>${fmt(fixedItems.reduce((a, i) => a + yearlyEq(i, mk), 0))}</b><span class="cap">fixed portion${
+        fixedItems.some(hasSchedule) ? ', twelve months from here' : ' only'}</span></div>
+    </div>
+    <section class="panel">
+      <div class="panel-hd"><h2>Fixed housing costs</h2><button class="addbtn" data-open="housing" style="margin-left:auto;display:flex"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Add item</button></div>
+      ${tbl || `<div class="empty"><h3>Nothing set up yet</h3>
+        <p>Add rent or your loan repayment, building charges, insurance and internet — anything billed at the same amount each month or year.</p>
+        <button class="btn pri" data-open="housing" style="flex:none">Add rent or loan</button></div>`}
+    </section>
+    <section class="panel">
+      <div class="panel-hd"><h2>Variable bills</h2><span class="sub">${monthLabel(mk)}</span></div>
+      ${logged.length ? txList(logged.sort((a,b)=>b.d.localeCompare(a.d)), { mk }) : `<div class="empty">
+        <h3>No housing bills logged</h3>
+        <p>Heating, electricity and water usually swing month to month. Log each bill as it lands, under the “Housing &amp; utilities” category.</p>
+        <button class="btn pri" data-open="add" data-cat="housing" style="flex:none">Log a bill</button></div>`}
+    </section>` };
+}
+
+function viewShip() {
+  const mk = state.cursor, st = monthStats(mk);
+  const year = Number(mk.split('-')[0]);
+  const yr = shipYear(year);
+  const r = reserveState();
+
+  let all = 0;
+  for (const k of Object.keys(state.months)) all += monthStats(k).ship.total;
+
+  const fields = SHIP_SUBS.map(([k, label]) => ({ k, label, m: st.ship[k], y: yr[k] }));
+  const maxY = Math.max(1, ...fields.map(f => f.y));
+  const entries = txOf(mk).filter(t => t.t !== 'inc' && t.c === 'ship').sort((a, b) => b.d.localeCompare(a.d));
+  const bars = recentMonths(12, mk).map(k => ({ k, v: monthStats(k).ship.total }));
+  const maxB = Math.max(1, ...bars.map(b => b.v));
+
+  return { html: `
+    <div class="tiles">
+      <div class="tile"><span class="eyebrow">${monthLabel(mk, true)}</span><b style="color:var(--accent)">${fmt(st.ship.total)}</b><span class="cap">${entries.length} ${entries.length === 1 ? 'purchase' : 'purchases'}</span></div>
+      <div class="tile"><span class="eyebrow">${year} so far</span><b>${fmt(yr.total)}</b><span class="cap">${fmt(yr.total / Math.max(1, Math.min(12, THIS_MONTH.startsWith(String(year)) ? TODAY.getMonth() + 1 : 12)))} a month on average</span></div>
+      <div class="tile"><span class="eyebrow">All time</span><b>${fmt(all)}</b><span class="cap">everything logged in the workshop</span></div>
+      <div class="tile"><span class="eyebrow">Drawn from reserve</span><b style="color:var(--accent)">${fmt(r.shipDrawn)}</b><span class="cap">the deliberate part of the draw</span></div>
+    </div>
+
+    <section class="panel">
+      <div class="panel-hd"><h2>The four benches</h2><span class="sub">${year} to date</span></div>
+      <div class="catlist" style="padding:10px 0">
+        ${fields.map(f => `<div class="catrow">
+          <span class="nm">${esc(f.label)}</span>
+          <span class="track"><i class="fill" style="width:${(f.y/maxY*100).toFixed(2)}%"></i></span>
+          <span class="vl">${fmt(f.y)}</span>
+        </div>`).join('')}
+      </div>
+      <div class="scroller" style="border-top:1px solid var(--line)"><table class="tbl">
+        <thead><tr><th>Bench</th><th class="r">${monthLabel(mk, true)}</th><th class="r">${year}</th><th class="r">Share of ${year}</th></tr></thead>
+        <tbody>${fields.map(f => `<tr>
+          <td><b style="font-weight:500">${esc(f.label)}</b></td>
+          <td class="r num">${f.m > 0.004 ? fmt(f.m, true) : '—'}</td>
+          <td class="r num">${f.y > 0.004 ? fmt(f.y) : '—'}</td>
+          <td class="r num" style="color:var(--ink-3)">${yr.total > 0.004 ? Math.round(f.y/yr.total*100) + '%' : '—'}</td>
+        </tr>`).join('')}
+        <tr><td><b>Total</b></td><td class="r num" style="font-weight:600">${fmt(st.ship.total, true)}</td>
+          <td class="r num" style="font-weight:600">${fmt(yr.total)}</td><td class="r num" style="color:var(--ink-3)">100%</td></tr>
+        </tbody></table></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hd"><h2>Twelve months at the bench</h2><span class="sub">${monthLabel(bars[0].k, true)} – ${monthLabel(bars[11].k, true)}</span></div>
+      <div class="catlist" style="padding:10px 0">
+        ${bars.slice().reverse().filter(b => b.v > 0.004).slice(0, 12).map(b => `<div class="catrow">
+          <span class="nm">${monthLabel(b.k)}</span>
+          <span class="track"><i class="fill" style="width:${(b.v/maxB*100).toFixed(2)}%"></i></span>
+          <span class="vl">${fmt(b.v)}</span></div>`).join('')
+          || `<p style="padding:14px 18px;margin:0;color:var(--ink-3);font-size:13px">Nothing logged in the last twelve months yet.</p>`}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-hd"><h2>${monthLabel(mk)} purchases</h2>
+        <button class="addbtn" data-open="add" data-cat="ship" style="margin-left:auto;display:flex"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Log a purchase</button></div>
+      ${entries.length ? entries.map(t => `<button class="txrow" data-edit="${t.id}" data-mk="${mk}">
+          <span class="mn"><b>${esc(t.n || SHIPNAME[t.sc] || 'Purchase')}</b><span>${esc(SHIPNAME[t.sc] || 'Ships & kits')} · ${parseISO(t.d).getDate()} ${MON3[parseISO(t.d).getMonth()]}${
+            t.docs && t.docs.length ? ` · <span class="clip">${ICON_CLIP}${t.docs.length}</span>` : ''}</span></span>
+          <span class="amt">${fmt(Number(t.a) || 0, true)}</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" style="stroke:var(--ink-3);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round"><path d="M9 5l7 7-7 7"/></svg>
+        </button>`).join('')
+        : `<div class="empty"><h3>Nothing logged for ${monthLabel(mk)}</h3>
+          <p>Kits, paints and pieces, tools, and naval history books each get their own bench, so you can see where the money really goes.</p>
+          <button class="btn pri" data-open="add" data-cat="ship" style="flex:none">Log a purchase</button></div>`}
+    </section>
+
+    <div class="banner"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+      <span>Shipwrighting is counted first against any month you go over your income, so the reserve shows what you chose to spend separately from what simply got away from you.</span></div>` };
+}
+
+/** How long ago, in the rough units people actually use. */
+function timeAgo(iso8601) {
+  const then = new Date(iso8601), mins = Math.round((Date.now() - then) / 60000);
+  if (mins < 60) return mins <= 1 ? 'just now' : `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+/** The automated emails Claude has set up for this app — read-only, kept in
+ *  sync by the scheduled task itself each time it actually sends one. */
+function schedulePanel() {
+  const items = state.schedule || [];
+  if (!items.length) return '';
+  return `<section class="panel">
+    <div class="panel-hd"><h2>Scheduled reports</h2><span class="sub">set up outside the app</span></div>
+    <div class="scroller"><table class="tbl">
+      <thead><tr><th>Report</th><th>When</th><th>To</th><th>Last sent</th></tr></thead>
+      <tbody>${items.map(it => `<tr>
+        <td><b style="font-weight:500">${esc(it.label)}</b></td>
+        <td style="color:var(--ink-3)">${esc(it.when)}</td>
+        <td style="color:var(--ink-3)">${esc(it.to || '')}</td>
+        <td>${it.lastSentAt
+          ? `<span class="num" title="${esc(it.lastSentAt)}">${timeAgo(it.lastSentAt)}</span>${it.lastSubject ? `<div style="font-size:11px;color:var(--ink-3)">${esc(it.lastSubject)}</div>` : ''}`
+          : '<span style="color:var(--ink-3)">not sent yet</span>'}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="panel-hd" style="border-bottom:none;border-top:1px solid var(--line)">
+      <span class="dl">Runs from Claude Code on your Mac, not from this page — ask Claude to change the schedule.</span>
+    </div>
+  </section>`;
+}
+
+function viewReport() {
+  const thisWeek = startOfWeek(TODAY);
+  const weeks = [];
+  for (let i = 11; i >= 0; i--) {
+    const ws = addDays(thisWeek, -7 * i);
+    weeks.push({ ws, v: variableBetween(ws, addDays(ws, 6)) });
+  }
+  const cur = weeks[11].v, prev = weeks[10].v;
+  const avg4 = weeks.slice(7, 11).reduce((a, w) => a + w.v, 0) / 4;
+  const ch = chartWeeks(weeks);
+
+  // month-to-date pace vs the same window last month
+  const dom = TODAY.getDate();
+  const mStart = new Date(TODAY.getFullYear(), TODAY.getMonth(), 1);
+  const mtd = variableBetween(mStart, TODAY);
+  const pm = addMonths(THIS_MONTH, -1);
+  const [py, pmo] = pm.split('-').map(Number);
+  const pDaysInMonth = new Date(py, pmo, 0).getDate();
+  const pEndDay = Math.min(dom, pDaysInMonth);
+  const prevMtd = variableBetween(new Date(py, pmo - 1, 1), new Date(py, pmo - 1, pEndDay));
+  const paceDiff = mtd - prevMtd;
+  const better = paceDiff < 0;
+
+  const f = forecast();
+  const fcPanel = !f.ready
+    ? `<section class="panel">
+        <div class="panel-hd"><h2>Month-end forecast</h2><span class="sub">not enough history yet</span></div>
+        <div class="empty"><h3>Forecasts unlock after your first full month</h3>
+          <p>Once there's a month of logged entries behind you, this shows where ${MONTHS[TODAY.getMonth()]} is heading — a calm case, a likely case and a busy case — plus what you can spend per day to stay off the reserve.</p>
+          <p style="color:var(--ink-2)"><b class="num">${f.st.ordinaryCount}</b> ordinary expenses logged · day <b class="num">${f.day}</b> of ${f.dim}</p></div>
+      </section>`
+    : `<section class="panel">
+        <div class="panel-hd"><h2>Where ${MONTHS[TODAY.getMonth()]} is heading</h2><span class="sub">${f.left} ${f.left === 1 ? 'day' : 'days'} left · from your own spending pace</span></div>
+        <div style="padding:20px 22px 16px;display:flex;flex-direction:column;gap:6px;border-bottom:1px solid var(--line)">
+          <span class="eyebrow">Daily allowance to stay off the reserve</span>
+          <span class="hero-fig ${f.allowance > 0 ? 'pos' : 'neg'}" style="font-size:clamp(30px,5.4vw,40px)">${f.allowance > 0 ? fmt(f.allowance, true) : fmt(0)}<span style="font-size:.4em;font-weight:500;color:var(--ink-3);letter-spacing:0"> / day</span></span>
+          <p class="hero-note">${f.allowance > 0
+            ? `Spend under this for the remaining ${f.left} ${f.left === 1 ? 'day' : 'days'} and ${MONTHS[TODAY.getMonth()]} stays inside the ${fmt(f.capacity)} your income covers.`
+            : `${MONTHS[TODAY.getMonth()]} has already passed the ${fmt(f.capacity)} your income covers. Anything more comes out of the reserve.`}</p>
+        </div>
+        <div class="cmpgrid">
+          ${f.scen.map(x => `<div class="cmpcell">
+            <span class="eyebrow">${x.name}${x.key === 'base' ? ' · likeliest' : ''}</span>
+            <b style="color:var(--${x.key === 'base' ? 'ink' : x.key === 'opt' ? 'pos' : 'neg'})">${fmt(x.total)}</b>
+            <span class="dl">${esc(x.note)}</span>
+            <span class="dl" style="margin-top:3px">${x.draw > 0.5
+              ? `<b style="color:var(--neg)">−${fmt(x.draw)}</b> from the reserve`
+              : `<b style="color:var(--pos)">reserve untouched</b>`}</span>
+            <span class="dl">${Math.abs(x.hp - x.hpNow) < 0.5
+              ? `health holds at <b>${Math.round(x.hp).toLocaleString('en-US')} HP</b>`
+              : `health <b style="color:var(--${x.hp > x.hpNow ? 'pos' : 'neg'})">${x.hp > x.hpNow ? '+' : ''}${Math.round(x.hp - x.hpNow).toLocaleString('en-US')}</b> → ${Math.round(x.hp).toLocaleString('en-US')} HP`}</span>
+          </div>`).join('')}
+        </div>
+        <div class="panel-hd" style="border-bottom:none;border-top:1px solid var(--line)">
+          <span class="dl">Projected from ${fmt(f.st.variable)} ordinary spending over ${f.day} ${f.day === 1 ? 'day' : 'days'}, plus ${fmt(f.st.fixed)} fixed and ${fmt(f.st.extraordinary)} extraordinary already logged. One-off costs do not set the pace or reduce Health Points.</span>
+        </div>
+      </section>`;
+
+  const sNow = monthStats(THIS_MONTH), sPrev = monthStats(pm);
+  const hist = recentMonths(6, THIS_MONTH).map(k => ({ k, s: monthStats(k) })).reverse();
+
+  const verdict = Math.abs(paceDiff) < 1
+    ? `Through day ${dom}, you are spending at <b>exactly the pace</b> of ${monthLabel(pm, true)}.`
+    : `Through day ${dom} you've spent <b class="${better ? 'pos' : 'neg'}">${fmt(Math.abs(paceDiff))} ${better ? 'less' : 'more'}</b> than you had by this point in ${monthLabel(pm, true)}.`;
+
+  return { html: `
+    <section class="panel" style="padding:22px 24px">
+      <span class="eyebrow">Ordinary spending · week of ${weekLabel(thisWeek)} · live</span>
+      <p class="verdict" style="margin:10px 0 0">${verdict}<br><em>${cur > avg4 * 1.15 ? 'This week is running hot against your four-week average.' : cur < avg4 * 0.85 ? 'This week is running below your four-week average.' : 'This week is tracking close to your four-week average.'} Extraordinary costs stay in the real totals below.</em></p>
+    </section>
+
+    ${schedulePanel()}
+
+    ${fcPanel}
+
+    <section class="panel" style="overflow:hidden">
+      <div class="panel-hd"><h2>Ordinary spending this week</h2><span class="sub">one-off costs and fixed commitments are excluded from the pace</span></div>
+      <div class="cmpgrid">
+        <div class="cmpcell"><span class="eyebrow">This week</span><b>${fmt(cur, true)}</b>${deltaLine(cur, prev, true, 'vs last week')}</div>
+        <div class="cmpcell"><span class="eyebrow">Last week</span><b style="color:var(--ink-2)">${fmt(prev, true)}</b><span class="dl">${weekLabel(weeks[10].ws)}</span></div>
+        <div class="cmpcell"><span class="eyebrow">4-week average</span><b style="color:var(--ink-2)">${fmt(avg4, true)}</b><span class="dl">the four weeks before this one</span></div>
+      </div>
+      <div class="chartbox" style="border-top:1px solid var(--line)"><div id="ch-weeks"></div></div>
+    </section>
+
+    ${weekBrowsePanel()}
+
+    <section class="panel">
+      <div class="panel-hd"><h2>Month on month</h2><span class="sub">only the middle figure is a like-for-like comparison</span></div>
+      <div class="cmpgrid">
+        <div class="cmpcell"><span class="eyebrow">${monthLabel(THIS_MONTH, true)} so far</span><b>${fmt(sNow.spend)}</b>${deltaLine(sNow.spend, sPrev.spend, true, `against all of ${monthLabel(pm, true)} (${fmt(sPrev.spend)})`, true)}</div>
+        <div class="cmpcell"><span class="eyebrow">Logged, same window</span><b>${fmt(mtd)}</b>${deltaLine(mtd, prevMtd, true, `vs ${monthLabel(pm, true)} days 1–${pEndDay}`)}</div>
+        <div class="cmpcell"><span class="eyebrow">Net ${monthLabel(THIS_MONTH, true)}</span><b style="color:var(--${sNow.net >= 0 ? 'pos' : 'neg'})">${fmtSigned(sNow.net)}</b>${deltaLine(sNow.net, sPrev.net, false, `against all of ${monthLabel(pm, true)}`, true)}</div>
+      </div>
+      <div class="scroller"><table class="tbl">
+        <thead><tr><th>Month</th><th class="r">Income</th><th class="r">Ordinary</th><th class="r">Extraordinary</th><th class="r">Fixed</th><th class="r">Total out</th><th class="r">Net</th></tr></thead>
+        <tbody>${hist.map(h => `<tr>
+          <td><b style="font-weight:500">${monthLabel(h.k)}</b>${h.k === THIS_MONTH ? ' <span class="chip">so far</span>' : ''}</td>
+          <td class="r num" style="color:var(--pos)">${h.s.income ? fmt(h.s.income) : '—'}</td>
+          <td class="r num">${h.s.variable ? fmt(h.s.variable) : '—'}</td>
+          <td class="r num">${h.s.extraordinary ? fmt(h.s.extraordinary) : '—'}</td>
+          <td class="r num" style="color:var(--ink-3)">${fmt(h.s.fixed)}</td>
+          <td class="r num">${fmt(h.s.spend)}</td>
+          <td class="r num" style="font-weight:500;color:var(--${h.s.net >= 0 ? 'pos' : 'neg'})">${fmtSigned(h.s.net)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </section>`,
+    wire(root) {
+      mountChart(ch, $('#ch-weeks', root));
+      const pv = $('#wkprev', root), nx = $('#wknext', root);
+      if (pv) pv.addEventListener('click', () => {
+        state.weekCursor = iso(addDays(parseISO(state.weekCursor), -7)); render();
+      });
+      if (nx) nx.addEventListener('click', () => {
+        if (nx.disabled) return;
+        state.weekCursor = iso(addDays(parseISO(state.weekCursor), 7)); render();
+      });
+    } };
+}
+
+/** Browse any past week: total, category breakdown, and its entries. */
+function weekBrowsePanel() {
+  const ws = parseISO(state.weekCursor);
+  const tx = weekTx(ws);
+  const spend = tx.filter(t => t.t !== 'inc').reduce((a, t) => a + (Number(t.a) || 0), 0);
+  const income = tx.filter(t => t.t === 'inc').reduce((a, t) => a + (Number(t.a) || 0), 0);
+  const rows = weekCatRows(tx);
+  const max = rows.length ? rows[0].v : 1;
+  const entryCount = tx.filter(t => t.t !== 'inc').length;
+  const atCurrent = state.weekCursor >= iso(startOfWeek(TODAY));
+  const list = [...tx].sort((a, b) => b.d.localeCompare(a.d));
+
+  return `<section class="panel">
+    <div class="panel-hd">
+      <h2>Browse a week</h2>
+      <div class="monthnav" style="margin-left:auto">
+        <button id="wkprev" aria-label="Previous week"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+        <span class="monthlbl">${weekLabel(ws)}</span>
+        <button id="wknext" aria-label="Next week" ${atCurrent ? 'disabled' : ''}><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
+      </div>
+    </div>
+    <div class="cmpgrid">
+      <div class="cmpcell"><span class="eyebrow">Spent</span><b style="color:var(--neg)">${fmt(spend, true)}</b><span class="dl">${entryCount} ${entryCount === 1 ? 'entry' : 'entries'}</span></div>
+      <div class="cmpcell"><span class="eyebrow">Income</span><b style="color:var(--pos)">${fmt(income, true)}</b><span class="dl">logged this week</span></div>
+      <div class="cmpcell"><span class="eyebrow">Net</span><b style="color:var(--${income - spend >= 0 ? 'pos' : 'neg'})">${fmtSigned(income - spend)}</b><span class="dl">${weekLabel(ws)}</span></div>
+    </div>
+    ${rows.length ? `<div class="catlist" style="padding:8px 0;border-top:1px solid var(--line)">
+      ${rows.map(r => `<div class="catrow">
+        <span class="nm">${esc(CATNAME[r.c] || r.c)}</span>
+        <span class="track"><i class="fill" style="width:${(r.v/max*100).toFixed(2)}%"></i></span>
+        <span class="vl">${fmt(r.v, true)}</span>
+      </div>`).join('')}
+    </div>` : ''}
+    ${list.length ? txList(list) : `<div class="empty" style="padding:24px 18px">
+      <h3>Nothing logged</h3><p>No entries fall in the week of ${weekLabel(ws)}.</p></div>`}
+  </section>`;
+}
+
+/* ============================ sheets ============================ */
+const scrim = () => $('#scrim'), sheetEl = () => $('#sheet');
+let lastFocus = null;
+
+/* Where the last click landed, in document coordinates. Capture phase, so it is
+   always recorded before any handler that opens a sheet. */
+let lastClickY = 0;
+document.addEventListener('click', (e) => {
+  if (e.clientY) lastClickY = e.clientY + window.scrollY;
+}, true);
+
+/* Some hosts render this page in a frame sized to the full content height. The
+   frame's viewport is then taller than the physical screen, `position: fixed`
+   anchors to that oversized viewport, and an overlay opens far below whatever
+   the reader can actually see — the button looks dead. A viewport taller than
+   the screen is only possible in that situation, so it is a reliable test.
+   In that case the overlay is positioned in the document instead, next to the
+   control that opened it, which is by definition on screen. */
+const framedTall = () => window.innerHeight > ((window.screen && window.screen.height) || 1200) + 60;
+
+function placeSheet() {
+  const sc = scrim(), sh = sheetEl();
+  if (framedTall()) {
+    const visible = Math.min(640, Math.round(((window.screen && window.screen.height) || 900) * 0.8));
+    sc.style.position = 'absolute';
+    sc.style.height = document.documentElement.scrollHeight + 'px';
+    sc.style.alignItems = 'flex-start';
+    sh.style.marginTop = Math.max(8, Math.round(lastClickY - visible * 0.35)) + 'px';
+    sh.style.maxHeight = visible + 'px';
+  } else {
+    sc.style.position = sc.style.height = sc.style.alignItems = '';
+    sh.style.marginTop = sh.style.maxHeight = '';
+  }
+}
+let openAttach = null;
+function openSheet(html, wire) {
+  lastFocus = document.activeElement;
+  sheetEl().innerHTML = html;
+  scrim().classList.add('on');
+  document.body.style.overflow = 'hidden';
+  wire && wire(sheetEl());
+  // Some hosts size this page's frame to its full content height, which leaves
+  // `position: fixed` anchored to a viewport taller than the screen — the sheet
+  // then opens off-screen and the button looks dead. scrollIntoView reaches
+  // through the frame and brings it back into view; it is a no-op when fixed
+  // positioning already did the right thing.
+  placeSheet();
+  const f = $('[data-autofocus]', sheetEl());
+  if (f) setTimeout(() => f.focus(), 80);
+}
+/**
+ * The attachments field, shared by the entry and commitment sheets.
+ * Returns a controller: `docs` is the live list to save, `cleanup(saved)`
+ * settles the assets — assets added and then abandoned are removed, and
+ * assets removed from a saved record are removed too.
+ */
+function attachField(root, initial, hint) {
+  const docs = (initial || []).map(d => ({ ...d }));
+  const ctl = { docs, cleanup: () => {} };
+  const added = [], dropped = [];
+  const wrap = $('#docwrap', root);
+  if (!wrap) return ctl;
+  if (!ASSETS) { wrap.hidden = true; return ctl; }
+
+  const list = $('#doclist', root), btn = $('#docadd', root), input = $('#docfile', root);
+  const draw = () => {
+    list.innerHTML = docs.map(d => `<div class="docrow">
+      <button type="button" class="docthumb" data-docview="${d.id}" title="View ${esc(d.name)}">
+        ${d.type && d.type.startsWith('image/') ? `<img src="${assetUrl(d.id)}" alt="">` : ICON_PDF}
+      </button>
+      <span class="docmeta"><b>${esc(d.name)}</b><span>${d.type === 'application/pdf' ? 'PDF' : 'Image'} · ${fileSize(d.size || 0)}</span></span>
+      <button type="button" class="iconbtn" data-docrm="${d.id}" aria-label="Remove ${esc(d.name)}">
+        <svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M8 7l1 13h6l1-13"/></svg></button>
+    </div>`).join('');
+  };
+  draw();
+
+  list.addEventListener('click', (e) => {
+    const v = e.target.closest('[data-docview]');
+    if (v) {
+      const doc = docs.find(d => d.id === v.dataset.docview);
+      if (doc) openDocViewer(root, doc);
+      return;
+    }
+    const b = e.target.closest('[data-docrm]');
+    if (!b) return;
+    const id = b.dataset.docrm, i = docs.findIndex(d => d.id === id);
+    if (i < 0) return;
+    docs.splice(i, 1);
+    (added.includes(id) ? added : dropped).push(id);
+    if (added.includes(id)) added.splice(added.indexOf(id), 1);
+    draw();
+  });
+
+  btn.addEventListener('click', () => input.click());
+  input.addEventListener('change', async () => {
+    const files = [...input.files];
+    input.value = '';
+    if (!files.length) return;
+    btn.disabled = true;
+    const label = btn.innerHTML;
+    for (let i = 0; i < files.length; i++) {
+      btn.textContent = files.length > 1 ? `Attaching ${i + 1} of ${files.length}…` : 'Attaching…';
+      try {
+        const { blob, type, name } = await prepareFile(files[i]);
+        const res = await ASSETS.upload(blob, { type });
+        docs.push({ id: res.id, name, type: res.contentType, size: res.sizeBytes });
+        added.push(res.id);
+        sheetError(root, '');
+        draw();
+      } catch (err) {
+        sheetError(root, assetMessage(err && err.code, files[i].name));
+      }
+    }
+    btn.disabled = false; btn.innerHTML = label;
+  });
+
+  /** saved=true destroys what was removed; saved=false unwinds what was added. */
+  ctl.cleanup = (saved) => {
+    (saved ? dropped : added).forEach(id => {
+      try { ASSETS.delete(id).catch(() => {}); } catch (e) {}
+    });
+    added.length = 0; dropped.length = 0;
+    if (openAttach === ctl) openAttach = null;
+  };
+  openAttach = ctl;
+  return ctl;
+}
+const docsFieldHTML = (hint) => `
+  <div class="fld" id="docwrap">
+    <label>Documents <span style="text-transform:none;letter-spacing:0">(optional)</span></label>
+    <div class="doclist" id="doclist"></div>
+    <button type="button" class="btn attach" id="docadd">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Attach a receipt or invoice</button>
+    <input type="file" id="docfile" accept="image/*,application/pdf" multiple hidden>
+    <p class="hint">${hint} Photos and PDFs, 20 MB each. Big photos are resized automatically. A Word or Excel file needs exporting to PDF first.</p>
+  </div>`;
+
+/** Say what is wrong instead of silently refusing to save. */
+function sheetError(root, msg, focusSel) {
+  const box = $('#sheet-err', root);
+  if (box) { box.textContent = msg || ''; box.hidden = !msg; }
+  if (msg && focusSel) { const el = $(focusSel, root); if (el) { el.focus(); el.scrollIntoView({ block: 'center' }); } }
+}
+function closeSheet() {
+  if (openAttach) { try { openAttach.cleanup(false); } catch (e) {} openAttach = null; }
+  scrim().classList.remove('on');
+  document.body.style.overflow = '';
+  const sc = scrim(), sh = sheetEl();
+  sc.style.position = sc.style.height = sc.style.alignItems = '';
+  sh.style.marginTop = sh.style.maxHeight = '';
+  setTimeout(() => { if (!scrim().classList.contains('on')) sheetEl().innerHTML = ''; }, 200);
+  if (lastFocus && lastFocus.isConnected) lastFocus.focus();
+}
+const closeIcon = `<button class="iconbtn" data-close aria-label="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>`;
+
+function sheetTx(existing, mk, presetCat, presetType = 'exp') {
+  const t = existing || {
+    id: null, t: presetType, a: '', c: presetCat || (presetType === 'extra' ? 'other' : 'food'), sc: presetCat === 'ship' ? 'ships' : '', n: '',
+    d: state.cursor === THIS_MONTH ? iso(TODAY) : state.cursor + '-01',
+  };
+  const cats = (type) => (type === 'inc' ? INC_CATS : EXP_CATS);
+  const html = `
+    <div class="sheet-hd"><h2>${existing ? 'Edit entry' : 'New entry'}</h2>${closeIcon}</div>
+    <div class="sheet-bd">
+      <div class="seg" id="tseg">
+        <button data-t="exp" aria-pressed="${t.t === 'exp'}">Expense</button>
+        <button data-t="extra" aria-pressed="${t.t === 'extra'}">Extraordinary</button>
+        <button data-t="inc" aria-pressed="${t.t === 'inc'}">Income</button>
+      </div>
+      <p class="hint">Extraordinary expenses remain in your real totals and reserve, but do not affect Health Points or ordinary spending pace.</p>
+      <div class="fld"><label for="f-amt">Amount</label>
+        <div class="amtwrap"><span>€</span><input id="f-amt" class="num" type="text" inputmode="decimal"
+          placeholder="0.00" value="${t.a === '' ? '' : t.a}" data-autofocus></div></div>
+      <div class="fld"><label>Category</label><div class="chips" id="catchips"></div></div>
+      <div class="fld" id="shipwrap" hidden><label>Which bench</label><div class="chips" id="shipchips"></div></div>
+      <div class="row2">
+        <div class="fld"><label for="f-date">Date</label><input id="f-date" class="inp num" type="date" value="${t.d}"></div>
+        <div class="fld"><label for="f-note">Note <span style="text-transform:none;letter-spacing:0">(optional)</span></label>
+          <input id="f-note" class="inp" type="text" maxlength="70" placeholder="e.g. Monoprix" value="${esc(t.n || '')}"></div>
+      </div>
+      ${docsFieldHTML('Keep the receipt with the entry.')}
+    </div>
+    <div class="sheet-bd" style="padding-top:0"><p class="err" id="sheet-err" hidden></p></div>
+    <div class="sheet-ft">
+      ${existing ? `<button class="btn danger" id="f-del">Delete</button>` : ''}
+      <button class="btn pri" id="f-save">${existing ? 'Save changes' : 'Add entry'}</button>
+    </div>`;
+
+  return openSheet(html, (root) => {
+    let type = t.t, cat = t.c, sub = t.sc || 'ships';
+    const att = attachField(root, t.docs, '');
+    const drawShip = () => {
+      const w = $('#shipwrap', root);
+      w.hidden = !(type !== 'inc' && cat === 'ship');
+      if (w.hidden) return;
+      $('#shipchips', root).innerHTML = SHIP_SUBS.map(([id, lbl]) =>
+        `<button type="button" data-s="${id}" aria-pressed="${id === sub}">${esc(lbl)}</button>`).join('');
+    };
+    const drawChips = () => {
+      const list = cats(type);
+      if (!list.some(([id]) => id === cat)) cat = list[0][0];
+      $('#catchips', root).innerHTML = list.map(([id, lbl]) =>
+        `<button type="button" data-c="${id}" aria-pressed="${id === cat}">${esc(lbl)}</button>`).join('');
+      drawShip();
+    };
+    drawChips();
+    $('#shipchips', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-s]'); if (!b) return;
+      sub = b.dataset.s;
+      $$('#shipchips [data-s]', root).forEach(x => x.setAttribute('aria-pressed', x.dataset.s === sub));
+    });
+    $('#tseg', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-t]'); if (!b) return;
+      type = b.dataset.t;
+      $$('#tseg [data-t]', root).forEach(x => x.setAttribute('aria-pressed', x.dataset.t === type));
+      drawChips();
+    });
+    $('#catchips', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-c]'); if (!b) return;
+      cat = b.dataset.c;
+      $$('#catchips [data-c]', root).forEach(x => x.setAttribute('aria-pressed', x.dataset.c === cat));
+      drawShip();
+    });
+    $('#f-save', root).addEventListener('click', () => { try {
+      const raw = $('#f-amt', root).value.replace(/[\s€]/g, '').replace(',', '.');
+      const amt = Math.abs(parseFloat(raw));
+      if (!isFinite(amt) || amt === 0) {
+        sheetError(root, raw.trim() ? `"${raw}" isn't an amount I can read. Try a plain number like 12.50.`
+                                    : 'Enter an amount first.', '#f-amt');
+        return;
+      }
+      sheetError(root, '');
+      const date = $('#f-date', root).value || iso(TODAY);
+      const note = $('#f-note', root).value.trim();
+      const rec = { id: t.id || uid(), t: type, a: Math.round(amt * 100) / 100, c: cat, d: date, n: note };
+      if (type === 'exp' && cat === 'ship') rec.sc = sub;
+      if (att.docs.length) rec.docs = att.docs;
+      att.cleanup(true);
+      if (t.id && state.months[mk]) {
+        state.months[mk] = { month: mk, tx: (state.months[mk].tx || []).filter(x => x.id !== t.id) };
+      }
+      const nmk = date.slice(0, 7);
+      state.months[nmk] = { month: nmk, tx: [...((state.months[nmk] || {}).tx || []), rec] };
+      persistMonth(nmk);
+      if (t.id && mk && mk !== nmk) persistMonth(mk);
+      closeSheet(); render();
+      } catch (err) { sheetError(root, 'Could not save that: ' + (err && err.message ? err.message : err)); }
+    });
+    const del = $('#f-del', root);
+    del && del.addEventListener('click', () => {
+      (t.docs || []).forEach(d => { try { ASSETS && ASSETS.delete(d.id).catch(() => {}); } catch (e) {} });
+      att.cleanup(true);
+      if (state.months[mk]) {
+        state.months[mk] = { month: mk, tx: (state.months[mk].tx || []).filter(x => x.id !== t.id) };
+      }
+      persistMonth(mk); closeSheet(); render();
+    });
+  });
+}
+
+function sheetRecurring(existing, kind) {
+  const k = existing ? existing.kind : kind;
+  const isSub = k === 'sub', isInc = k === 'income';
+  const r = existing || {
+    id: null, name: '', amount: '', basis: 'monthly', kind: k,
+    category: isSub ? 'entertainment' : isInc ? 'other-in' : 'housing', status: 'active', since: '', ended: '', note: '',
+  };
+  const schedText = (it) => schedMonths(it).map(m => `${m}  ${it.schedule[m]}`).join('\n');
+  const html = `
+    <div class="sheet-hd"><h2>${existing ? 'Edit' : isSub ? 'New subscription' : isInc ? 'New standing income' : 'New housing cost'}</h2>${closeIcon}</div>
+    <div class="sheet-bd">
+      <div class="fld"><label for="r-name">${isSub ? 'Service' : isInc ? 'Where it comes from' : 'What is it'}</label>
+        <input id="r-name" class="inp" type="text" maxlength="50" data-autofocus
+          placeholder="${isSub ? 'e.g. Netflix' : isInc ? 'e.g. Parent subsidy, Scholarship' : 'e.g. Rent, Heating, Home insurance'}" value="${esc(r.name)}"></div>
+      <div class="fld"><label for="r-amt">${isInc ? 'Amount received' : 'Amount charged'}</label>
+        <div class="amtwrap"><span>€</span><input id="r-amt" class="num" type="text" inputmode="decimal"
+          placeholder="0.00" value="${r.amount === '' ? '' : r.amount}"></div></div>
+      <div class="fld"><label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px">
+          <input type="checkbox" id="r-varies" ${hasSchedule(r) ? 'checked' : ''}>
+          ${isInc ? 'The amount changes from month to month' : 'The amount changes from month to month'}</label>
+        <div id="r-schedwrap" ${hasSchedule(r) ? '' : 'hidden'}>
+          <textarea id="r-sched" class="inp" rows="7" style="font-family:var(--mono);font-size:12.5px"
+            placeholder="2026-10  1301.87&#10;2026-11  1265.67">${esc(schedText(r))}</textarea>
+          <p class="hint" id="r-schedinfo">One month per line: the month, then the amount. Months you don't list fall back to the amount above.</p>
+        </div></div>
+      <div class="fld"><label>Billing cycle</label>
+        <div class="seg" id="r-basis">
+          <button data-b="monthly" aria-pressed="${r.basis === 'monthly'}">Every month</button>
+          <button data-b="yearly" aria-pressed="${r.basis === 'yearly'}">Once a year</button>
+        </div>
+        <p class="hint" id="r-conv"></p></div>
+      <div class="row2">
+        <div class="fld"><label for="r-cat">Category</label>
+          <select id="r-cat" class="inp">${(isInc ? INC_CATS : EXP_CATS).map(([id, l]) =>
+            `<option value="${id}" ${id === r.category ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></div>
+        <div class="fld"><label for="r-since">${isInc ? 'Receiving since' : 'Paying since'}</label>
+          <input id="r-since" class="inp num" type="month" value="${r.since || ''}" max="${THIS_MONTH}"></div>
+      </div>
+      <div class="fld"><label>Status</label>
+        <div class="seg" id="r-status">
+          <button data-s="active" aria-pressed="${r.status === 'active'}">${isInc ? 'Still coming in' : 'Still paying'}</button>
+          <button data-s="ended" aria-pressed="${r.status !== 'active'}">${isInc ? 'Stopped' : 'Cancelled'}</button>
+        </div></div>
+      <div class="fld" id="r-endwrap" hidden><label for="r-ended">${isInc ? 'Last month received' : 'Last month billed'}</label>
+        <input id="r-ended" class="inp num" type="month" value="${r.ended || ''}">
+        <p class="hint">Months up to and including this one still count the charge; later months don't.</p></div>
+      ${docsFieldHTML(isSub ? 'Keep the invoice or plan details here.'
+        : isInc ? 'Keep the letter or the agreement here.' : 'Keep the lease, the policy or a bill here.')}
+    </div>
+    <div class="sheet-bd" style="padding-top:0"><p class="err" id="sheet-err" hidden></p></div>
+    <div class="sheet-ft">
+      ${existing ? `<button class="btn danger" id="r-del">Delete</button>` : ''}
+      <button class="btn pri" id="r-save">${existing ? 'Save changes' : 'Add'}</button>
+    </div>`;
+
+  return openSheet(html, (root) => {
+    let basis = r.basis, status = r.status;
+    const att = attachField(root, r.docs, '');
+    const conv = () => {
+      const v = parseFloat($('#r-amt', root).value.replace(',', '.'));
+      const el = $('#r-conv', root);
+      if (!isFinite(v) || v <= 0) { el.textContent = basis === 'yearly' ? 'A yearly price is spread evenly across the twelve months.' : ''; return; }
+      el.innerHTML = basis === 'yearly'
+        ? `Counted as <b class="num">${fmt(v / 12, true)} a month</b> — ${fmt(v)} spread across the year.`
+        : `Counted as <b class="num">${fmt(v * 12)} a year</b>.`;
+    };
+    $('#r-amt', root).addEventListener('input', conv); conv();
+    /* "2026-10  1301.87" a line; also accepts a colon, an equals sign or a comma decimal. */
+    const parseSched = (text) => {
+      const out = {}, bad = [];
+      for (const raw of String(text || '').split('\n')) {
+        const line = raw.trim();
+        if (!line) continue;
+        const m = /^(\d{4})[-/ ]?(\d{1,2})\s*[:=\s]\s*€?\s*(-?[\d .,]+)$/.exec(line);
+        const v = m ? parseFloat(m[3].replace(/[\s.](?=\d{3}\b)/g, '').replace(',', '.')) : NaN;
+        if (!m || !isFinite(v) || Number(m[2]) < 1 || Number(m[2]) > 12) { bad.push(line); continue; }
+        out[`${m[1]}-${String(Number(m[2])).padStart(2, '0')}`] = Math.abs(Math.round(v * 100) / 100);
+      }
+      return { out, bad };
+    };
+    const varies = $('#r-varies', root), schedBox = $('#r-sched', root);
+    const schedInfo = () => {
+      const { out, bad } = parseSched(schedBox.value);
+      const keys = Object.keys(out).sort();
+      const el = $('#r-schedinfo', root);
+      if (bad.length) {
+        el.innerHTML = `<span style="color:var(--neg)">Could not read ${bad.length} line${bad.length === 1 ? '' : 's'}</span> — each needs a month and an amount, like <b class="num">2026-10  1301.87</b>.`;
+        return;
+      }
+      if (!keys.length) { el.textContent = "One month per line: the month, then the amount. Months you don't list fall back to the amount above."; return; }
+      const sum = keys.reduce((a, k) => a + out[k], 0);
+      const next = keys.find(k => k >= THIS_MONTH) || keys[keys.length - 1];
+      el.innerHTML = `<b class="num">${keys.length}</b> months scheduled, ${monthLabel(keys[0], true)} to ${monthLabel(keys[keys.length - 1], true)} · total <b class="num">${fmt(sum)}</b> · ${
+        next >= THIS_MONTH ? `${monthLabel(next, true)}: <b class="num">${fmt(out[next], true)}</b>` : 'all in the past'}.`;
+    };
+    varies.addEventListener('change', () => {
+      $('#r-schedwrap', root).hidden = !varies.checked;
+      if (varies.checked) schedBox.focus();
+    });
+    schedBox.addEventListener('input', schedInfo); schedInfo();
+    $('#r-basis', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-b]'); if (!b) return;
+      basis = b.dataset.b;
+      $$('#r-basis [data-b]', root).forEach(x => x.setAttribute('aria-pressed', x.dataset.b === basis));
+      conv();
+    });
+    const syncStatus = () => { $('#r-endwrap', root).hidden = status === 'active'; };
+    $('#r-status', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-s]'); if (!b) return;
+      status = b.dataset.s;
+      $$('#r-status [data-s]', root).forEach(x => x.setAttribute('aria-pressed', x.dataset.s === status));
+      syncStatus();
+    });
+    syncStatus();
+    $('#r-save', root).addEventListener('click', () => { try {
+      const name = $('#r-name', root).value.trim();
+      const rawAmt = $('#r-amt', root).value.replace(/[\s€]/g, '').replace(',', '.');
+      const amt = Math.abs(parseFloat(rawAmt));
+      if (!name) {
+        sheetError(root, `Give it a name first — ${isSub ? 'the service you are paying for' : isInc ? 'where the money comes from' : 'what the cost is for'}.`, '#r-name');
+        return;
+      }
+      const sched = varies.checked ? parseSched(schedBox.value) : { out: {}, bad: [] };
+      if (sched.bad.length) {
+        sheetError(root, `Line ${sched.bad.length === 1 ? '' : 's'} I could not read in the monthly amounts: "${sched.bad[0]}". Each line needs a month and an amount, like 2026-10  1301.87.`, '#r-sched');
+        return;
+      }
+      const scheduled = Object.keys(sched.out).length;
+      if (!isFinite(amt) || amt === 0) {
+        // with a schedule the plain amount is only a fallback, so the first scheduled figure will do
+        if (scheduled) {
+          sheetError(root, '');
+        } else {
+          sheetError(root, rawAmt.trim() ? `"${rawAmt}" isn't an amount I can read. Try a plain number like 11.99.`
+                                         : isInc ? 'Enter what comes in.' : 'Enter what it costs.', '#r-amt');
+          return;
+        }
+      }
+      sheetError(root, '');
+      const fallback = isFinite(amt) && amt !== 0
+        ? Math.round(amt * 100) / 100
+        : sched.out[Object.keys(sched.out).sort().pop()];
+      const rec = {
+        id: r.id || uid(), name, amount: fallback, basis, kind: k,
+        category: $('#r-cat', root).value, status,
+        since: $('#r-since', root).value || '',
+        ended: status === 'active' ? '' : ($('#r-ended', root).value || ''),
+      };
+      if (scheduled) rec.schedule = sched.out;
+      if (att.docs.length) rec.docs = att.docs;
+      att.cleanup(true);
+      state.recurring = state.recurring.some(x => x.id === rec.id)
+        ? state.recurring.map(x => (x.id === rec.id ? rec : x))
+        : [...state.recurring, rec];
+      persistRecurring(); closeSheet(); render();
+      } catch (err) { sheetError(root, 'Could not save that: ' + (err && err.message ? err.message : err)); }
+    });
+    const del = $('#r-del', root);
+    del && del.addEventListener('click', () => {
+      (r.docs || []).forEach(d => { try { ASSETS && ASSETS.delete(d.id).catch(() => {}); } catch (e) {} });
+      att.cleanup(true);
+      state.recurring = state.recurring.filter(x => x.id !== r.id);
+      persistRecurring(); closeSheet(); render();
+    });
+  });
+}
+
+/* ---------------- backup and restore ----------------
+   Standing on its own the app keeps everything in this browser. That is only safe
+   if the whole lot can be lifted out to a file and put back somewhere else. */
+const BACKUP_KEYS = ['months', 'recurring', 'settings'];
+function backupBlob() {
+  const out = { app: 'expense-tracker', version: 1, savedAt: new Date().toISOString() };
+  for (const k of BACKUP_KEYS) out[k] = state[k];
+  return JSON.stringify(out, null, 1);
+}
+async function restoreBackup(text) {
+  let d;
+  try { d = JSON.parse(text); } catch (e) { throw new Error('That file is not readable as a backup.'); }
+  if (!d || typeof d !== 'object' || d.app !== 'expense-tracker')
+    throw new Error('That is not an Expense Tracker backup.');
+  for (const k of BACKUP_KEYS) if (d[k] !== undefined) state[k] = d[k];
+  state.months = state.months || {};
+  cacheLocal();
+  if (DB) {
+    await Promise.allSettled([
+      DB.doc('config/settings').set(state.settings || {}),
+      DB.doc('config/recurring').set({ items: state.recurring || [] }),
+      ...Object.entries(state.months).map(([k, v]) => DB.doc('ledger/' + k).set(v)),
+    ]);
+  }
+  render();
+}
+/** The phone hides the rail, so what lives there needs another way in. */
+function sheetMore() {
+  const item = (id, name, note) => `<button class="btn" id="${id}" style="text-align:left;padding:13px 15px">
+    <b style="display:block">${name}</b><span class="dl">${note}</span></button>`;
+  openSheet(`
+    <div class="sheet-hd"><h2>More</h2>${closeIcon}</div>
+    <div class="sheet-bd">
+      ${item('more-cfg', 'Salary &amp; reserve', 'What comes in each month, and the reserve you are protecting.')}
+      ${item('more-bk', 'Backup', 'Save everything to a file, or restore it from one.')}
+    </div>`, (root) => {
+    $('#more-cfg', root).addEventListener('click', () => { closeSheet(); sheetSettings(); });
+    $('#more-bk', root).addEventListener('click', () => { closeSheet(); sheetBackup(); });
+  });
+}
+
+function sheetBackup() {
+  const months = Object.keys(state.months || {}).length;
+  const rows = Object.values(state.months || {}).reduce((a, m) => a + ((m.items || m.rows || []).length), 0);
+  openSheet(`
+    <div class="sheet-hd"><h2>Backup</h2>${closeIcon}</div>
+    <div class="sheet-bd">
+      <p class="hint" style="margin:0">${DB
+        ? 'This copy syncs, so a backup is insurance rather than a necessity.'
+        : 'This copy keeps everything in this browser alone. A backup is the only way to move it, or to get it back.'}</p>
+      <div class="banner"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg><span>${months} month${months === 1 ? '' : 's'} of entries · ${rows} line${rows === 1 ? '' : 's'} · ${(state.recurring || []).length} subscriptions</span></div>
+      <button class="btn pri" id="bk-save" style="text-align:left;padding:13px 15px">
+        <b style="display:block">Save a backup</b>
+        <span class="dl">One JSON file with everything in it.</span></button>
+      <div class="fld" style="margin-top:4px"><label for="bk-file">Restore from a backup</label>
+        <input id="bk-file" class="inp" type="file" accept="application/json,.json">
+        <p class="hint">This replaces everything currently here. Save a backup first if you are not sure.</p></div>
+      <p class="hint">Documents attached to an expense are not in the backup — they live in the app's own file store, which a backup file cannot carry.</p>
+      <p class="hint" id="bk-msg"></p>
+    </div>
+    <div class="sheet-bd" style="padding-top:0"><p class="err" id="sheet-err" hidden></p></div>`, (root) => {
+    $('#bk-save', root).addEventListener('click', async () => {
+      await offer(`expense-tracker-${iso(new Date())}.json`, backupBlob());
+    });
+    $('#bk-file', root).addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      try {
+        await restoreBackup(await f.text());
+        $('#bk-msg', root).innerHTML = '<b class="pos">Restored.</b> Everything has been replaced.';
+      } catch (err) { sheetError(root, err && err.message || String(err)); e.target.value = ''; }
+    });
+  });
+}
+
+function sheetSettings() {
+  const c = cfg(), r = reserveState();
+  openSheet(`
+    <div class="sheet-hd"><h2>Salary, reserve &amp; health</h2>${closeIcon}</div>
+    <div class="sheet-bd">
+      <div class="fld"><label for="s-inc">What you earn in a normal month</label>
+        <div class="amtwrap"><span>€</span><input id="s-inc" class="num" type="text" inputmode="decimal" value="${c.baselineIncome}" data-autofocus></div>
+        <p class="hint">Spending above this comes out of the reserve. If you log more income than this in a given month, the larger figure is used for that month.</p></div>
+      <div class="fld"><label for="s-sal">Salary, posted on the 1st</label>
+        <div class="amtwrap"><span>€</span><input id="s-sal" class="num" type="text" inputmode="decimal" value="${c.salaryOn ? c.salary : 0}"></div>
+        <p class="hint">Added to every month automatically, from the month below onwards — you never type it in. Set it to 0 to turn it off. Bonuses, grants and reimbursements you still log yourself as income.</p></div>
+      <div class="fld"><label for="s-salfrom">Salary starts</label>
+        <input id="s-salfrom" class="inp num" type="month" value="${c.salaryFrom || THIS_MONTH}"></div>
+      <div class="fld"><label for="s-res">Reserve you can mobilise</label>
+        <div class="amtwrap"><span>€</span><input id="s-res" class="num" type="text" inputmode="decimal" value="${c.reserveStart}"></div></div>
+      <div class="fld"><label for="s-hp">Health points at full</label>
+        <input id="s-hp" class="inp num" type="text" inputmode="decimal" value="${c.hpMax}">
+        <p class="hint">One point per euro. Spend past what your income covers and you lose points; come in under and you heal back, never above full.</p></div>
+      <div class="fld"><label>Shipwrighting</label>
+        <div class="seg" id="s-ship">
+          <button data-h="0" aria-pressed="${!c.hpIgnoreShip}">Costs health</button>
+          <button data-h="1" aria-pressed="${!!c.hpIgnoreShip}">Free of charge</button>
+        </div>
+        <p class="hint">Either way it still draws on the reserve — this only decides whether your passion also costs you points.</p></div>
+      <div class="fld"><label for="s-from">Start counting from</label>
+        <input id="s-from" class="inp num" type="month" value="${c.reserveAsOf}" max="${THIS_MONTH}">
+        <p class="hint">Months before this one never touch the reserve, so backfilled history won't eat into it.</p></div>
+      <div class="banner"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
+        <span>Currently <b class="num">${fmt(r.remaining)}</b> of ${fmt(c.reserveStart)} left, ${fmt(r.drawn)} drawn since ${monthLabel(c.reserveAsOf, true)}. Surpluses are never credited back — the pot only shrinks.</span></div>
+      <div class="fld" id="storewrap" hidden><label>Attached documents</label>
+        <p class="hint" id="storemeter">Counting…</p></div>
+    </div>
+    <div class="sheet-ft"><button class="btn pri" id="s-save">Save</button></div>`, (root) => {
+    if (ASSETS) {
+      $('#storewrap', root).hidden = false;
+      const meter = $('#storemeter', root);
+      meter.textContent = 'Receipts and invoices attached to entries live on this device.';
+      if (typeof ASSETS.list === 'function') {
+        Promise.resolve().then(() => ASSETS.list()).then(({ usage }) => {
+          if (!meter.isConnected) return;
+          meter.textContent = `${usage.files} of ${usage.maxFiles} files · ${fileSize(usage.bytes)} of ${fileSize(usage.maxBytes)} used. `
+            + 'Receipts and invoices you attach to entries live here; removing an attachment deletes the file for good.';
+        }).catch(() => { if (meter.isConnected) meter.textContent = 'Document storage figures unavailable right now.'; });
+      }
+    }
+    let ignoreShip = !!c.hpIgnoreShip;
+    $('#s-ship', root).addEventListener('click', e => {
+      const b = e.target.closest('[data-h]'); if (!b) return;
+      ignoreShip = b.dataset.h === '1';
+      $$('#s-ship [data-h]', root).forEach(x => x.setAttribute('aria-pressed', (x.dataset.h === '1') === ignoreShip));
+    });
+    $('#s-save', root).addEventListener('click', () => {
+      const num = (id, dflt) => {
+        const v = parseFloat($(id, root).value.replace(/\s/g, '').replace(',', '.'));
+        return isFinite(v) && v >= 0 ? Math.round(v * 100) / 100 : dflt;
+      };
+      state.settings = {
+        baselineIncome: num('#s-inc', c.baselineIncome),
+        reserveStart: num('#s-res', c.reserveStart),
+        reserveAsOf: $('#s-from', root).value || c.reserveAsOf,
+        hpMax: Math.max(1, num('#s-hp', c.hpMax)),
+        hpIgnoreShip: ignoreShip,
+        salary: num('#s-sal', c.salary),
+        salaryOn: num('#s-sal', c.salary) > 0,
+        salaryFrom: $('#s-salfrom', root).value || c.salaryFrom || THIS_MONTH,
+      };
+      persistSettings(); closeSheet(); render();
+    });
+  });
+}
+
+/* ============================ router ============================ */
+const VIEWS = {
+  overview: { title: 'Overview',        fn: viewOverview },
+  ledger:   { title: 'Ledger',          fn: viewLedger },
+  extra:    { title: 'Extraordinary expenses', fn: viewExtra },
+  ship:     { title: 'Model shipwrighting', fn: viewShip },
+  subs:     { title: 'Subscriptions',   fn: viewSubs },
+  housing:  { title: 'Housing',         fn: viewHousing },
+  report:   { title: 'Weekly report',   fn: viewReport },
+};
+function render() {
+  const v = VIEWS[state.view] || VIEWS.overview;
+  const out = v.fn();
+  MOUNTED = [];
+  const root = $('#view');
+  root.innerHTML = out.html;
+  out.wire && out.wire(root);
+  $('#viewname').textContent = v.title;
+  $('#mlbl').textContent = monthLabel(state.cursor);
+  $('#mnext').disabled = state.cursor >= THIS_MONTH;
+  $('#monthnav').style.visibility = state.view === 'report' ? 'hidden' : '';
+  $$('[data-nav]').forEach(b => {
+    if (b.closest('.rail') || b.closest('.tabbar')) {
+      b.setAttribute('aria-current', b.dataset.nav === state.view ? 'page' : 'false');
+    }
+  });
+  hideTip();
+}
+const go = (v) => { state.view = v; scrollTo({ top: 0, behavior: 'instant' }); render(); };
+
+document.addEventListener('click', (e) => {
+  const nav = e.target.closest('[data-nav]');
+  if (nav) { go(nav.dataset.nav); return; }
+  if (e.target.closest('[data-close]') || e.target === scrim()) { closeSheet(); return; }
+  const open = e.target.closest('[data-open]');
+  if (open) {
+    const w = open.dataset.open;
+    if (w === 'add') sheetTx(null, state.cursor, open.dataset.cat);
+    else if (w === 'extra') sheetTx(null, state.cursor, null, 'extra');
+    else if (w === 'sub') sheetRecurring(null, 'sub');
+    else if (w === 'housing') sheetRecurring(null, 'housing');
+    else if (w === 'income') sheetRecurring(null, 'income');
+    else if (w === 'settings') sheetSettings();
+    return;
+  }
+  const co = e.target.closest('[data-catopen]');
+  if (co) { sheetCategory(state.cursor, co.dataset.catopen); return; }
+  const ed = e.target.closest('[data-edit]');
+  if (ed) {
+    const mk = ed.dataset.mk || state.cursor;
+    const t = (state.months[mk]?.tx || []).find(x => x.id === ed.dataset.edit);
+    if (t) sheetTx(t, mk);
+    return;
+  }
+  const rc = e.target.closest('[data-rec]');
+  if (rc) {
+    const it = state.recurring.find(x => x.id === rc.dataset.rec);
+    if (it) sheetRecurring(it, it.kind);
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && scrim().classList.contains('on')) closeSheet();
+});
+$('#mprev').addEventListener('click', () => { state.cursor = addMonths(state.cursor, -1); render(); });
+$('#mnext').addEventListener('click', () => {
+  if (state.cursor >= THIS_MONTH) return;
+  state.cursor = addMonths(state.cursor, 1); render();
+});
+$('#addTop').addEventListener('click', () => sheetTx(null, state.cursor));
+$('#cfgBtn').addEventListener('click', sheetSettings);
+$('#bkBtn').addEventListener('click', sheetBackup);
+$('#moreBtn').addEventListener('click', sheetMore);
+$('#fab').addEventListener('click', () => sheetTx(null, state.cursor));
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => render());
+
+/* ============================ boot ============================ */
+loadLocal();
+render();
+setSync(DB ? 'Synced' : 'Connecting…');
+
+(async () => {
+  let db = null;
+  try { db = await (window.claude?.use?.('db')); } catch (e) { db = null; }
+  try { ASSETS = await (window.claude?.use?.('assets')); } catch (e) { ASSETS = null; }
+  try { DOWNLOADS = await (window.claude?.use?.('downloads')); } catch (e) { DOWNLOADS = null; }
+  if (!db) { setSync('This device only', true); return; }
+  DB = db;
+  setSync('Synced');
+  db.doc('config/settings').onSnapshot(
+    (snap) => { if (snap.exists) { state.settings = thaw(snap.data()) || {}; cacheLocal(); render(); } },
+    () => setSync('Sync interrupted', true)
+  );
+  db.doc('config/recurring').onSnapshot(
+    (snap) => { if (snap.exists) { state.recurring = thaw(snap.data().items) || []; cacheLocal(); render(); } },
+    () => setSync('Sync interrupted', true)
+  );
+  db.doc('config/schedule').onSnapshot(
+    (snap) => { state.schedule = (snap.exists && thaw(snap.data().items)) || []; cacheLocal(); render(); },
+    () => {}
+  );
+  db.collection('ledger').onSnapshot(
+    (snap) => {
+      const next = {};
+      snap.docs.forEach(d => { next[d.id] = { month: d.id, tx: thaw(d.data().tx) || [] }; });
+      state.months = next; cacheLocal(); render();
+    },
+    () => setSync('Sync interrupted', true)
+  );
+})();
+</script>
+
+<link rel="stylesheet" href="../shared/motion.css?v=1">
+<script type="module" src="../shared/motion.mjs?v=1"></script>
+</body>
+</html>

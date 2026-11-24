@@ -1,0 +1,16 @@
+{
+  "name": "Hours & Days",
+  "short_name": "Hours",
+  "description": "Where the week actually goes: work, the bench, the reading, the plan against it.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f2f0ea",
+  "theme_color": "#f2f0ea",
+  "icons": [
+    { "src": "icon-192.png?v=9e6c408366", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png?v=9e6c408366", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png?v=9e6c408366", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

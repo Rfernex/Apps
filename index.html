@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Apps</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f2f0ea">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1c1a17">
+<style>
+  :root { color-scheme: light dark; --ink:#1c1a17; --soft:#6a6259; --line:#ddd8cd; --paper:#f2f0ea; --card:#faf9f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#f2f0ea; --soft:#a49b8e; --line:#37332c; --paper:#1c1a17; --card:#232019; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:34px 20px 46px; background:var(--paper); color:var(--ink);
+         font:15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  main { max-width:520px; margin:0 auto; }
+  .eyebrow { font:11px/1 ui-monospace, Menlo, monospace; letter-spacing:.14em; text-transform:uppercase; color:var(--soft); }
+  h1 { margin:10px 0 4px; font:600 25px/1.2 Georgia, "Times New Roman", serif; letter-spacing:-.01em; }
+  p.lead { margin:0 0 26px; color:var(--soft); font-size:14px; }
+  a.app { display:flex; gap:15px; align-items:center; text-decoration:none; color:inherit;
+          background:var(--card); border:1px solid var(--line); border-radius:4px;
+          padding:15px 16px; margin-bottom:11px; }
+  a.app:hover { border-color:var(--soft); }
+  a.app img { width:46px; height:46px; border-radius:9px; flex:none; }
+  a.app b { display:block; font-size:16px; font-weight:600; }
+  a.app span { display:block; font-size:12.5px; color:var(--soft); margin-top:2px; }
+  .note { margin-top:26px; padding-top:16px; border-top:1px solid var(--line);
+          font-size:12.5px; color:var(--soft); }
+  .note b { color:var(--ink); font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Romain Fernex</div>
+  <h1>Apps</h1>
+  <p class="lead">Two little tools for everyday life. Install them on your phone, or open them here.</p>
+
+  <a class="app" href="hours/">
+    <img src="hours/icon-192.png?v=9e6c408366" alt="">
+    <span><b>Hours &amp; Days</b>
+      <span>Where the week actually goes: work, the bench, the reading, and the plan against it.</span></span>
+  </a>
+
+  <a class="app" href="ledger/">
+    <img src="ledger/icon-192.png?v=b46d500c61" alt="">
+    <span><b>Expense Tracker</b>
+      <span>What comes in, what goes out, and how much of the reserve is left.</span></span>
+  </a>
+
+  <p class="note">On an iPhone, open one in <b>Safari</b> and use Share → <b>Add to Home Screen</b>. It installs with its own icon and opens without a browser bar. The apps keep separate data until you turn sync on — tap the sync line in the app (bottom of the side rail, or the "Sync" pill on a phone) and paste a GitHub token to link it to your other devices, or use <b>Backup</b> to move a copy over by hand.</p>
+</main>
+
+<link rel="stylesheet" href="shared/motion.css?v=1">
+<script type="module" src="shared/motion.mjs?v=1"></script>
+</body>
+</html>
