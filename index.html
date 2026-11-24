@@ -35,7 +35,7 @@
 <main>
   <div class="eyebrow">Romain Fernex</div>
   <h1>Apps</h1>
-  <p class="lead">Two little tools for everyday life. Install them on your phone, or open them here.</p>
+  <p class="lead">Six little tools for everyday life. Install them on your phone, or open them here.</p>
 
   <a class="app" href="hours/">
     <img src="hours/icon-192.png?v=9e6c408366" alt="">
@@ -49,10 +49,46 @@
       <span>What comes in, what goes out, and how much of the reserve is left.</span></span>
   </a>
 
-  <p class="note">On an iPhone, open one in <b>Safari</b> and use Share → <b>Add to Home Screen</b>. It installs with its own icon and opens without a browser bar. The apps keep separate data until you turn sync on — tap the sync line in the app (bottom of the side rail, or the "Sync" pill on a phone) and paste a GitHub token to link it to your other devices, or use <b>Backup</b> to move a copy over by hand.</p>
+  <a class="app" href="phd/">
+    <img src="phd/icon-192.png?v=centered-dossier-9" alt="">
+    <span><b>Admissions</b>
+      <span>Every PhD application, its documents and letters, deadlines and replies.</span></span>
+  </a>
+
+  <a class="app" href="italian/">
+    <img src="italian/icon-192.png?v=amphitheatre-3" alt="">
+    <span><b>Italiano</b>
+      <span>A little Italian, every day. Vocabulary, grammar, verbs and sentences that teach you.</span></span>
+  </a>
+
+  <a class="app" href="reading/">
+    <img src="reading/icon-192.png" alt="">
+    <span><b>Reading Room</b>
+      <span>Your Zotero bookshelf, chapter progress and private on-device reminders.</span></span>
+  </a>
+
+  <a class="app" href="gre-quest/">
+    <img src="gre-quest/icon-192.png" alt="">
+    <span><b>GRE Quant Quest</b>
+      <span>Practice GRE Quant with questions, formulas, field notes and memory cards.</span></span>
+  </a>
+
+  <p class="note">On an iPhone, open one in <b>Safari</b> and use Share → <b>Add to Home Screen</b>. It installs with its own icon and opens without a browser bar. Italiano and Reading Room keep progress on each device; use their Progress tabs to export or restore a backup. The other apps keep separate data until you turn sync on — tap the sync line in the app (bottom of the side rail, or the "Sync" pill on a phone) and paste a GitHub token to link it to your other devices, or use <b>Backup</b> to move a copy over by hand.</p>
 </main>
 
 <link rel="stylesheet" href="shared/motion.css?v=1">
 <script type="module" src="shared/motion.mjs?v=1"></script>
+<script>
+(function () {
+  var m = /[#&]key=([A-Za-z0-9_-]{40,})/.exec(location.hash);
+  if (!m) return;
+  try { localStorage.setItem('appsKey.v1', m[1]); } catch (e) { return; }
+  history.replaceState(null, '', location.pathname + location.search);
+  var p = document.createElement('p');
+  p.className = 'note';
+  p.innerHTML = '<b>This device is unlocked.</b> The private apps open here from now on.';
+  document.querySelector('main').insertBefore(p, document.querySelector('main .app'));
+})();
+</script>
 </body>
 </html>

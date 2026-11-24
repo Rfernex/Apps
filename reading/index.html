@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Reading Room</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Reading Room">
+<style>
+  :root { color-scheme: light dark; --ink:#1c1a17; --soft:#6a6259; --line:#c9c2b4; --paper:#f2f0ea; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#f2f0ea; --soft:#a49b8e; --line:#4a453c; --paper:#1c1a17; } }
+  body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:30rem; margin:0 auto; padding:calc(14vh + env(safe-area-inset-top)) 16px 40px; }
+  img { display:block; width:56px; height:56px; margin-bottom:18px; }
+  h1 { font-size:24px; margin:0 0 6px; letter-spacing:-.01em; }
+  p { margin:0 0 14px; color:var(--soft); }
+  form { display:grid; gap:8px; margin:22px 0 12px; }
+  form[hidden], button[hidden] { display:none; }
+  label { font-weight:600; color:var(--ink); }
+  input { font:inherit; padding:9px 10px; border:1px solid var(--line); border-radius:0; background:transparent; color:var(--ink); }
+  button { font:inherit; font-weight:600; padding:9px 14px; border:1px solid var(--ink); border-radius:0; background:var(--ink); color:var(--paper); cursor:pointer; justify-self:start; }
+  #gate-status { color:var(--ink); min-height:1.5em; }
+  .small { font-size:13px; border-top:1px solid var(--line); padding-top:12px; margin-top:22px; }
+</style>
+</head>
+<body>
+<main>
+  <img src="icon-192.png" alt="">
+  <h1>Reading Room</h1>
+  <p>A private app. Its content is encrypted and opens only on its owner's devices.</p>
+  <form id="gate-form" hidden>
+    <label for="gate-key">Key or unlock link</label>
+    <input id="gate-key" type="password" autocomplete="off" spellcheck="false">
+    <button type="submit">Open</button>
+  </form>
+  <p id="gate-status" role="status"></p>
+  <button id="gate-retry" type="button" hidden>Try again</button>
+  <p class="small">The key stays in this browser and opens every private app on this site.</p>
+</main>
+<script src="../shared/private-gate.js?v=2" data-app="reading"></script>
+</body>
+</html>

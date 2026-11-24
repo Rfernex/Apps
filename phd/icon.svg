@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Ivory admissions dossier with a gold approval seal on vivid blue">
+<rect x="0" y="0" width="512" height="512" fill="#2863B3"/>
+<path d="M 0 0 L 512 0 L 512 162 L 0 396 Z" fill="#3B78C5"/>
+<path d="M 0 512 L 512 238 L 512 512 Z" fill="#174483"/>
+<g transform="translate(0 27)">
+<path d="M 104 92 C 104 80 114 72 126 72 L 323 72 L 398 147 L 398 393 C 398 406 388 414 376 414 L 126 414 C 114 414 104 406 104 393 Z" fill="#D6E5F0"/>
+<path d="M 119 78 L 119 62 C 119 50 129 42 141 42 L 323 42 L 389 108 L 389 374 C 389 387 380 395 367 395 L 141 395 C 129 395 119 387 119 374 Z" fill="#F4F0E7"/>
+<path d="M 119 78 L 119 62 C 119 50 129 42 141 42 L 323 42 L 323 55 L 141 55 C 135 55 132 59 132 65 L 132 78 Z" fill="#FFFFFF"/>
+<path d="M 323 42 L 389 108 L 332 108 C 326 108 323 104 323 98 Z" fill="#E3D8C5"/>
+<path d="M 323 42 L 389 108 L 377 108 L 323 55 Z" fill="#FFFFFF"/>
+<polyline points="151,132 357,132" fill="none" stroke="#B4A078" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 170 197 L 256 152 L 342 197 Z" fill="#E8AE43"/>
+<path d="M 192 188 L 256 160 L 320 188 Z" fill="#FFD878"/>
+<rect x="178" y="198" width="156" height="7" fill="#B7792D"/>
+<rect x="193" y="211" width="28" height="42" fill="#E8AE43"/>
+<rect x="198" y="211" width="4" height="42" fill="#FFD878"/>
+<rect x="242" y="211" width="28" height="42" fill="#E8AE43"/>
+<rect x="247" y="211" width="4" height="42" fill="#FFD878"/>
+<rect x="291" y="211" width="28" height="42" fill="#E8AE43"/>
+<rect x="296" y="211" width="4" height="42" fill="#FFD878"/>
+<rect x="180" y="254" width="152" height="9" fill="#B7792D"/>
+<rect x="164" y="289" width="144" height="6" fill="#9CB2C9"/>
+<rect x="164" y="309" width="123" height="6" fill="#9CB2C9"/>
+<rect x="164" y="329" width="93" height="6" fill="#9CB2C9"/>
+<ellipse cx="337.5" cy="362.5" rx="82.5" ry="82.5" fill="#174483"/>
+<ellipse cx="328.5" cy="353.5" rx="82.5" ry="82.5" fill="#B7792D"/>
+<ellipse cx="328.5" cy="353.5" rx="74.5" ry="74.5" fill="#E8AE43"/>
+<ellipse cx="328.5" cy="353.5" rx="61.5" ry="61.5" fill="#FFD878"/>
+<ellipse cx="328.5" cy="353.5" rx="49.5" ry="49.5" fill="#E8AE43"/>
+<path d="M 288 351 L 309 372 L 364 319 L 375 331 L 309 394 L 277 362 Z" fill="#FFFFFF"/>
+</g>
+</svg>
